@@ -306,6 +306,44 @@ X->,   40 B: node~~~~,s~~/ch/01/config "" 0 OFF 0~~~~
 
 Please note: You should run the X32 a first time and issue a "/shutdown" command from a connected client; this will create a file preserving all X32 parameters, that will be read at next start. Make sure you end your client sessions with "/shutdown" to update the file with the changes made to X32.
 
+```
+gcc -O2 -o X32 X32.c X32lib/Xsprint.c X32lib/Xdump.c -lm
+./X32 -i 127.0.0.1
+./X32 -e en0          # macOS: pick an interface instead of the first IPv4 address
+```
+
+The emulator listens on UDP port 10023. Point X32-Edit (or any OSC client) at that address. On macOS the idle loop sleeps, and `-i` / `-e` choose the bind address or interface (`en0` is typical; `-e` is the name from `ifconfig`). Every incoming OSC packet is printed on one line (`OSC /save ,siss scene`).
+
+#### Shows, scenes, and snippets
+
+X32-Edit pushes a scene by applying that scene's OSC lines to the live mixer (the same lines a `.scn` file contains, or the mix you just edited). It then asks the desk to snapshot that state:
+
+```
+/save ,siss scene 3 "Verse" "night set"
+/load ,si scene 3
+/delete ,si scene 3
+```
+
+Slots are 0–99. `/save` writes the current engine into `./x32data/scene/003.scn` and the name, notes, safes, and has-data flag into `./x32data/scenes.idx`. `/load` copies that snapshot back into the running mixer. Scene safes (and the show's channel safes) are applied on recall; scene 0 ignores its own safe mask. The show name and its ten safe integers live in `./x32data/show.txt`.
+
+A snippet is partial. Set the slot filters first (they are not arguments of `/save`), then snapshot:
+
+```
+/-show/showfile/snippet/002/eventtyp ,i 64
+/-show/showfile/snippet/002/channels ,i 1
+/-show/showfile/snippet/002/auxbuses ,i 0
+/-show/showfile/snippet/002/maingrps ,i 0
+/save ,sis snippet 2 "Faders"
+```
+
+`eventtyp` bits select parameter groups (preamp, config, EQ, dynamics, fader, mute, sends, effects, routing, …). `channels`, `auxbuses`, and `maingrps` select which strips are included. The body is `./x32data/snippet/002.snp`; the catalog is `./x32data/snippets.idx`.
+
+List what is stored with `/showdump` or `/node ,s -show/showfile/scene/003` (and the same for `snippet` and `cue`). `/-stat/scene/index` and `/-stat/snippet/index` are the current scene and snippet. The highlighted row is `/-show/prepos/current`, and `/-prefs/show_control` chooses which list that row belongs to (0 cues, 1 scenes, 2 snippets). After `/load`, memory is already updated; a client should read back the parameters it displays.
+
+Cues are `/add ,sis cue <number> <name>` (number `1252` is cue 12.5.2) and land in `./x32data/cues.idx`. `/-action/goscene`, `/-action/gosnippet`, and `/-action/gocue` recall. `/-action/initshow ,i 1` clears the show. `/-action/savestate ,i 1` writes `.X32res.rc` and stays running. `/shutdown` still saves and quits.
+
+Channel, effect, and routing presets use the same pattern (`/save`, `/load`, `/delete`, `/copy` with `libchan`, `libfx`, `librout`). Files are `./x32data/libch/`, `libfx/`, and `librt/`, with names in `libs.idx`. `/-libs/ch|fx|r/NNN/name` and `hasdata` answer the reads X32-Edit uses while moving libraries. These files are reloaded on the next start. `./x32data` is runtime data; it is not part of the source tree.
+
 Some X32 commands are not implemented (lack of time mostly), some are also not present as this program was developed before FW2.14 was released. You are welcome to dive in the code and add them :-)
 
 ### X32UDP ###

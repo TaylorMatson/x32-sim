@@ -37,11 +37,14 @@
 // 0.86: Fixed missing comma in XiQeq[] definitions
 // 0.87: Partial fix for /meters command
 // 0.88: Fix for /meters/5 and /meter/6 timefactor control
+// 0.89: show, scene, snippet and library retention under ./x32data
+//       (save/load/delete/copy/add, /-show, /-action, /-libs, /showdump)
 //
 #ifdef __WIN32__
 #include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <direct.h>
 #define ZMemory(a,b)	ZeroMemory(a, b)
 #else
 #define ZMemory(a,b)	memset(a, 0, b)
@@ -64,6 +67,7 @@
 #include <math.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <time.h>
 
 #define EPSILON 0.0001	// epsilon for float comparisons
@@ -290,6 +294,12 @@ int function_renew();
 int function_libs();
 int function_showdump();
 int function();
+void x32_data_init(void);
+void x32_log_osc(void);
+int x32_stat_index(void);
+void x32_action_hook(void);
+void x32_after_show_set(void);
+int x32_osc_has_arg(void);
 //
 float Xr_float(char* Xin, int l);
 
@@ -845,6 +855,7 @@ int Xdebug = X32DEBUG;			// if verbose: debug status
 int zero = 0;					// a value of 0 we can point to
 int one = 1;					// a value to 1 we can point to
 int keep_on = 1;				// main loop flag
+int x32_shutdown_quit = 1;		// /-action/savestate saves without leaving the loop
 time_t xremote_time;			// time value for /xremote command
 char tmp_str[48];				// temporary string
 
@@ -854,6 +865,7 @@ struct sockaddr *Client_ip_pt = (struct sockaddr*) &Client_ip;
 struct sockaddr *Server_ip_pt = (struct sockaddr*) &Server_ip;
 char Xport_str[8];
 char Xip_str[32];
+char Xif_str[32];				// optional interface name (-e)
 
 fd_set readfds;
 struct timeval timeout;
@@ -875,11 +887,16 @@ int main(int argc, char **argv) {
 // Manage arguments
 	fflush(stdout);
 	noIP = 1;
-	while ((input_intch = getopt(argc, argv, "i:d:v:x:b:f:r:m:h")) != -1) {
+	Xif_str[0] = 0;
+	while ((input_intch = getopt(argc, argv, "i:e:d:v:x:b:f:r:m:h")) != -1) {
 		switch ((char)input_intch) {
 		case 'i':
 			strcpy(Xip_str, optarg );
 			noIP = 0;
+			break;
+		case 'e':
+			strncpy(Xif_str, optarg, 31);
+			Xif_str[31] = 0;
 			break;
 		case 'd':
 			sscanf(optarg, "%d", &Xdebug);
@@ -904,7 +921,8 @@ int main(int argc, char **argv) {
 			break;
 		default:
 		case 'h':
-			printf("usage: X32 [-i <IP address>] - default: first IP available on system\n");
+			printf("usage: X32 [-i <IP address>] - default: first non-loopback IPv4\n");
+			printf("           [-e <interface>] - default: first non-loopback (macOS often en0)\n");
 			printf(" [-d 0/1, debug option] - default: 0\n");
 			printf(" [-v 0/1, verbose option] - default: 1\n");
 			printf(" The options below apply in conjunction with -v 1\n");
@@ -943,7 +961,7 @@ int main(int argc, char **argv) {
 #endif
 //
 	r_len = 0;
-	printf("X32 - v0.88 - An X32 Emulator - (c)2014-2019 Patrick-Gilles Maillot\n");
+	printf("X32 - v0.89 - An X32 Emulator - (c)2014-2019 Patrick-Gilles Maillot\n");
 	//
 	// Get or use IP address
 	if (noIP) {
@@ -990,13 +1008,15 @@ int main(int argc, char **argv) {
 			}
 		}
 	}
+	x32_data_init();
 	// Wait for messages from client, with non blocking socket
-	timeout.tv_sec = 0;
-	timeout.tv_usec = 10000; //Set timeout for non blocking recvfrom(): 10ms
 	while (keep_on) { // Main, receiving loop (active as long as keep_on is 1)
 		whoto = 0;
 		FD_ZERO(&readfds);
 		FD_SET(Xfd, &readfds);
+		// select() consumes the timeout on macOS and Linux; reset it every pass
+		timeout.tv_sec = 0;
+		timeout.tv_usec = 10000; // 10ms
 		p_status = select(Xfd + 1, &readfds, NULL, NULL, &timeout);
 		if ((p_status = FD_ISSET(Xfd, &readfds)) < 0) {
 			printf("Error while receiving\n");
@@ -1006,7 +1026,10 @@ int main(int argc, char **argv) {
 			// We have received data - process it!
 			// and if appropriate, reply to the address received into Client addr (ip_pt)
 			r_len = recvfrom(Xfd, r_buf, BSIZE, 0, Client_ip_pt, &Client_ip_len);
+			if (r_len < 0) r_len = 0;
+			if (r_len >= BSIZE) r_len = BSIZE - 1;
 			r_buf[r_len] = 0;
+			x32_log_osc();
 			if (Xverbose) {
 				if (strncmp(r_buf, "/xre", 4) == 0) {
 					if (X_remote) {
@@ -1052,10 +1075,9 @@ int main(int argc, char **argv) {
 			// Done receiving/managing command parameters;
 			Xsend(whoto);
 		}
-#ifdef __linux__
-		else
-		{
-			usleep( 10 );
+#ifndef __WIN32__
+		else {
+			usleep(1000); // keep the idle loop from spinning on macOS and Linux
 		}
 #endif
 		//
@@ -1107,24 +1129,28 @@ void getmyIP() {
 
 	if (getifaddrs(&ifaddr) == -1) {
 		perror("getifaddrs");
+		strcpy(Xip_str, "0.0.0.0");
 		return;
 	}
 	for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
-		if (ifa->ifa_addr != NULL) {
-			// use r_buf as we may need a large string
-			if ((s = getnameinfo(ifa->ifa_addr,sizeof(struct sockaddr_in), r_buf, NI_MAXHOST, NULL, 0, NI_NUMERICHOST)) == 0) {
-// you typically have to replace "en0" by "wlan0", "eth0",... depending on your physical interface support
-				if ((strcmp(ifa->ifa_name,"en0") == 0) && (ifa->ifa_addr->sa_family == AF_INET)) {
- //printf("\tInterface : <%s>\n",ifa->ifa_name );
- //printf("\t Address : <%s>\n", r_buf);
-					strcpy(Xip_str, r_buf); // update Xip_str
-					freeifaddrs(ifaddr);
-					return;
-				}
+		if (ifa->ifa_addr == NULL || ifa->ifa_addr->sa_family != AF_INET) continue;
+		// use r_buf as we may need a large string
+		s = getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in), r_buf, NI_MAXHOST, NULL, 0, NI_NUMERICHOST);
+		if (s != 0) continue;
+		if (Xif_str[0]) {
+			if (strcmp(ifa->ifa_name, Xif_str) == 0) {
+				strcpy(Xip_str, r_buf);
+				freeifaddrs(ifaddr);
+				return;
 			}
+		} else if (strncmp(r_buf, "127.", 4) != 0) {
+			strcpy(Xip_str, r_buf);
+			freeifaddrs(ifaddr);
+			return;
 		}
 	}
 	freeifaddrs(ifaddr);
+	strcpy(Xip_str, "0.0.0.0");
 	return;
 }
 #endif
@@ -4581,6 +4607,8 @@ int function_prefs() {
 int function_stat() {
 	int i;
 //
+	if (strcmp(r_buf, "/-stat/scene/index") == 0 || strcmp(r_buf, "/-stat/snippet/index") == 0)
+		return x32_stat_index();
 // check for lock command
 	if (strstr(r_buf, "/lock")) {
 		// shutdown is /-stat/lock ,i 2, that's int 0x0002 at index 19
@@ -4961,6 +4989,7 @@ int function_renew() {
 int function_action() {
 	int i;
 //
+	x32_action_hook();
 // check for actual command
 	i = 0;
 	while (i < Xaction_max) {
@@ -4976,15 +5005,18 @@ int function_action() {
 //
 // /-show command
 int function_show() {
-	int i;
+	int i, r, setting;
 //
 // check for actual command
 	i = 0;
+	setting = x32_osc_has_arg();
 	if (strncmp(r_buf + 16, "scene", 5) == 0) {
 		while (i < Xscene_max) {
 			if (strcmp(r_buf, Xscene[i].command) == 0) {
 				// found command at index i
-				return (funct_params(Xscene, i));
+				r = funct_params(Xscene, i);
+				if (setting && r) x32_after_show_set();
+				return r;
 			}
 			i += 1;
 		}
@@ -4994,7 +5026,9 @@ int function_show() {
 		while (i < Xsnippet_max) {
 			if (strcmp(r_buf, Xsnippet[i].command) == 0) {
 				// found command at index i
-				return (funct_params(Xsnippet, i));
+				r = funct_params(Xsnippet, i);
+				if (setting && r) x32_after_show_set();
+				return r;
 			}
 			i += 1;
 		}
@@ -5003,7 +5037,9 @@ int function_show() {
 	while (i < Xshow_max) {
 		if (strcmp(r_buf, Xshow[i].command) == 0) {
 			// found command at index i
-			return (funct_params(Xshow, i));
+			r = funct_params(Xshow, i);
+			if (setting && r) x32_after_show_set();
+			return r;
 		}
 		i += 1;
 	}
@@ -5011,360 +5047,8 @@ int function_show() {
 }
 
 //
-// /copy command
-int function_copy() {
-	int i, j, srce, dest, mask;
-	X32command *ch_src, *ch_dst;
-//
-// Copy function - format is /copy~~~,siii~~~type source destination mask
-//
-// At present time, /copy only implements 'libchan'
-// TODO: 'scene', 'libfx', 'librout' should be implemented
-// 'snippet' is not supported on X32
-	i = 0;
-	if (strcmp(r_buf + 16, "libchan") == 0) {
-		i = 24;
-		j = 4;
-		while (j)
-			endian.cc[--j] = r_buf[i++];
-		srce = endian.ii;
-		j = 4;
-		while (j)
-			endian.cc[--j] = r_buf[i++];
-		dest = endian.ii;
-		j = 4;
-		while (j)
-			endian.cc[--j] = r_buf[i++];
-		mask = endian.ii;
-		//
-		if ((srce >= 0) && (srce < 32) && (dest >= 0) && (dest < 32)) {
-			// copy channel <srce> to channel <dest>, for bits in <mask>
-			ch_src = Xchannelset[srce];
-			ch_dst = Xchannelset[dest];
+// /copy /add /load /save /delete /libs /showdump: X32ShowData.c
 
-			if (mask & C_CONFIG) {
-				//config: i= 1-7
-				for (i = 0; i < 8; i++) {
-					ch_dst[i].value.ii = ch_src[i].value.ii;
-				}
-			}
-			if (mask & C_HA) {
-				//preamp: i= 8-19
-				for (i = 8; i < 20; i++) {
-					ch_dst[i].value.ii = ch_src[i].value.ii;
-				}
-			}
-			if (mask & C_GATE) {
-				//gate: i= 20-32
-				for (i = 20; i < 33; i++) {
-					ch_dst[i].value.ii = ch_src[i].value.ii;
-				}
-			}
-			if (mask & C_DYN) {
-				//dyn: i= 33-52
-				for (i = 33; i < 53; i++) {
-					ch_dst[i].value.ii = ch_src[i].value.ii;
-				}
-			}
-			if (mask & C_EQ) {
-				//eq: i= 53-74
-				for (i = 53; i < 75; i++) {
-					ch_dst[i].value.ii = ch_src[i].value.ii;
-				}
-			}
-			if (mask & C_SEND) {
-				//sends: i= 75-145
-				for (i = 75; i < 146; i++) {
-					ch_dst[i].value.ii = ch_src[i].value.ii;
-				}
-			}
-			// All done
-			s_len = Xsprint(s_buf, 0, 's', "/copy");
-			s_len = Xsprint(s_buf, s_len, 's', ",si");
-			s_len = Xsprint(s_buf, s_len, 's', "libchan");
-			s_len = Xsprint(s_buf, s_len, 'i', &one);
-			return S_SND;
-		} else {
-			// Error somewhere
-			s_len = Xsprint(s_buf, 0, 's', "/copy");
-			s_len = Xsprint(s_buf, s_len, 's', ",si");
-			s_len = Xsprint(s_buf, s_len, 's', "libchan");
-			s_len = Xsprint(s_buf, s_len, 'i', &zero);
-			return S_SND;
-		}
-	}
-	return 0;
-}
-
-//
-// /add command
-int function_add() {
-//
-// add function - format is /add~~~~,sis~~~~type number name
-//
-// TODO: do a proper implementation of the function
-	printf("Nothing actually added\n");
-	fflush(stdout);
-	if (strcmp(r_buf + 16, "cue") == 0) {
-		// test... do nothing, just return OK status
-		s_len = Xsprint(s_buf, 0, 's', "/add");
-		s_len = Xsprint(s_buf, s_len, 's', ",si");
-		s_len = Xsprint(s_buf, s_len, 's', "cue");
-		s_len = Xsprint(s_buf, s_len, 'i', &one);
-	}
-	return S_SND;
-}
-
-//
-// /load command
-int function_load() {
-//
-// load function - format is /load~~~~,siii~~~~type number name
-//
-// TODO: do a proper implementation of the function
-	printf("Nothing actually loaded\n");
-	fflush(stdout);
-	s_len = Xsprint(s_buf, 0, 's', "/load");
-	s_len = Xsprint(s_buf, s_len, 's', ",si");
-	s_len = Xsprint(s_buf, s_len, 's', "libchan");
-	s_len = Xsprint(s_buf, s_len, 'i', &one);
-	return S_SND;
-}
-
-//
-// /save command
-int function_save() {
-	int i, j;
-//
-// save function - format is /save~~~,si[s|i,..]~~~type number name note value
-// Only 'sce', 'snippet' are implemented. 'libchan' is OK too
-// TODO: implement 'libfx' and 'librout'
-	i = 0;
-	if (strcmp(r_buf + 16, "scene") == 0) {
-		i = 24;
-		//get sscene index
-		// /save~~~,siss~~~scene~~~[i] name note
-		j = 4;
-		while (j) endian.cc[--j] = r_buf[i++];
-		sprintf(tmp_str, "/-show/showfile/scene/%03d/name", endian.ii);
-		for (j = 0; j < Xscene_max; j++) {
-			if ((strcmp(tmp_str, Xscene[j].command)) == 0) {
-				// save name
-				if (Xscene[j].value.str) free(Xscene[j].value.str);
-				if ((s_len = strlen(r_buf + i)) > 0) {
-					Xscene[j].value.str = malloc((s_len + 8) * sizeof(char));
-					strncpy(Xscene[j].value.str, r_buf + i, s_len);
-					Xscene[j].value.str[s_len] = 0;
-				} else {
-					Xscene[j].value.str = NULL;
-				}
-				// save note in j+1, note data is at i + s_len % 4
-				i = (i + s_len + 4) & 0xfffffffc;
-				if (Xscene[j + 1].value.str) free(Xscene[j + 1].value.str);
-				if ((s_len = strlen(r_buf + i)) > 0) {
-					Xscene[j + 1].value.str = malloc((s_len + 8) * sizeof(char));
-					strncpy(Xscene[j + 1].value.str, r_buf + i, s_len);
-					Xscene[j + 1].value.str[s_len] = 0;
-				} else {
-					Xscene[j + 1].value.str = NULL;
-				}
-				//
-				// update remote clients
-				s_len = Xfprint(s_buf, 0, Xscene[j].command, 's', Xscene[j].value.str);
-				Xsend(S_REM); // update xremote clients
-				s_len = Xfprint(s_buf, 0, Xscene[j + 1].command, 's', Xscene[j + 1].value.str);
-				Xsend(S_REM); // update xremote clients
-				//
-				// collect and save (locally) scene data
-				// save corresponding data as nodes in "hasdata" indicator (at j+2)
-				// todo: this is not actually done here!
-				// hasdata should point to .data and not to .ii and a set of node commands should be saved
-				Xscene[j + 2].value.ii = 1;
-				s_len = Xfprint(s_buf, 0, Xscene[j + 2].command, 'i', &one);
-				Xsend(S_REM); // update xremote clients
-				//
-				s_len = Xsprint(s_buf, 0, 's', "/save");
-				s_len = Xsprint(s_buf, s_len, 's', ",si");
-				s_len = Xsprint(s_buf, s_len, 's', "scene");
-				s_len = Xsprint(s_buf, s_len, 'i', &one);
-				return S_SND;
-			}
-		}
-		//Scene not found
-		s_len = Xsprint(s_buf, 0, 's', "/save");
-		s_len = Xsprint(s_buf, s_len, 's', ",si");
-		s_len = Xsprint(s_buf, s_len, 's', "scene");
-		s_len = Xsprint(s_buf, s_len, 'i', &zero);
-		return S_SND;
-	} else if (strcmp(r_buf + 16, "snippet") == 0) {
-		i = 24;
-		//get snippet index
-		j = 4;
-		while (j) endian.cc[--j] = r_buf[i++];
-		sprintf(tmp_str, "/-show/showfile/snippet/%03d/name", endian.ii);
-		for (j = 0; j < Xsnippet_max; j++) {
-			if ((strcmp(tmp_str, Xsnippet[j].command)) == 0) {
-				if (Xsnippet[j].value.str) free(Xsnippet[j].value.str);
-				if ((s_len = strlen(r_buf + i)) > 0) {
-					Xsnippet[j].value.str = malloc((s_len + 8) * sizeof(char));
-					strncpy(Xsnippet[j].value.str, r_buf + i, s_len);
-					Xsnippet[j].value.str[s_len] = 0;
-				} else {
-					Xsnippet[j].value.str = NULL;
-				}
-				//
-				// TODO At this time the last two <string><int> parameters are ignored
-				//
-				// update remote clients
-				s_len = Xfprint(s_buf, 0, tmp_str, 's', Xsnippet[j].value.str);
-				Xsend(S_REM); // update xremote clients
-				//
-				// collect and save (locally) snippet data
-				// save corresponding data as nodes in "hasdata" indicator (at j+1)
-				// todo: this is not actually done here!
-				// hasdata should point to .data and not to .ii and a set of node commands should be saved
-				Xsnippet[j + 1].value.ii = 1;
-				s_len = Xfprint(s_buf, 0, Xsnippet[j + 1].command, 'i', &one);
-				Xsend(S_REM); // update xremote clients
-				//
-				s_len = Xsprint(s_buf, 0, 's', "/save");
-				s_len = Xsprint(s_buf, s_len, 's', ",si");
-				s_len = Xsprint(s_buf, s_len, 's', "snippet");
-				s_len = Xsprint(s_buf, s_len, 'i', &one);
-				// update requesting client
-				return S_SND;
-			}
-		}
-		// Snippet not found
-		s_len = Xsprint(s_buf, 0, 's', "/save");
-		s_len = Xsprint(s_buf, s_len, 's', ",si");
-		s_len = Xsprint(s_buf, s_len, 's', "snippet");
-		s_len = Xsprint(s_buf, s_len, 'i', &zero);
-		return S_SND;
-	} else if (strcmp(r_buf + 16, "libchan") == 0) {
-		printf("Nothing actually saved\n");
-		fflush(stdout);
-		i = 20;
-		// test... do nothing, just return OK status
-		s_len = Xsprint(s_buf, 0, 's', "/save");
-		s_len = Xsprint(s_buf, s_len, 's', ",si");
-		s_len = Xsprint(s_buf, s_len, 's', "libchan");
-		s_len = Xsprint(s_buf, s_len, 'i', &one);
-		return S_SND;
-	}
-	return 0;
-}
-
-//
-// /delete command
-int function_delete() {
-	int i, j;
-//
-// delete function - format is /delete~,si~~~~type number
-	i = 0;
-	if (strcmp(r_buf + 12, "scene") == 0) {
-		i = 20;
-		//get scene index
-		j = 4;
-		while (j) endian.cc[--j] = r_buf[i++];
-		sprintf(tmp_str, "/-show/showfile/scene/%03d/name", endian.ii);
-		for (j = 0; j < Xscene_max; j++) {
-			if ((strcmp(tmp_str, Xscene[j].command)) == 0) {
-				// found name
-				if (Xscene[j].value.str) free(Xscene[j].value.str);
-				Xscene[j].value.str = NULL;
-				if (Xscene[j + 1].value.str) free(Xscene[j + 1].value.str);
-				Xscene[j + 1].value.str = NULL;
-				Xscene[j + 2].value.ii = 0; // No data
-				// update remote clients
-				s_len = Xfprint(s_buf, 0, Xscene[j].command, 's', Xscene[j].value.str);
-				Xsend(S_REM); // update xremote clients
-				s_len = Xfprint(s_buf, 0, Xscene[j + 1].command, 's', Xscene[j + 1].value.str);
-				Xsend(S_REM); // update xremote clients
-				// todo: this is not actually done here!
-				// hasdata should point to .data and not to .ii and a set of node commands should be saved
-				s_len = Xfprint(s_buf, 0, Xscene[j + 2].command, 'i', &zero);
-				Xsend(S_REM); // update xremote clients
-				// return OK status
-				s_len = Xsprint(s_buf, 0, 's', "/delete");
-				s_len = Xsprint(s_buf, s_len, 's', ",si");
-				s_len = Xsprint(s_buf, s_len, 's', "scene");
-				s_len = Xsprint(s_buf, s_len, 'i', &one);
-				return S_SND;
-			}
-		}
-		// Not found.. just return NOK status
-		s_len = Xsprint(s_buf, 0, 's', "/delete");
-		s_len = Xsprint(s_buf, s_len, 's', ",si");
-		s_len = Xsprint(s_buf, s_len, 's', "scene");
-		s_len = Xsprint(s_buf, s_len, 'i', &zero);
-		return S_SND;
-	}
-	if (strcmp(r_buf + 12, "snippet") == 0) {
-		i = 20;
-		//get snippet index
-		j = 4;
-		while (j) endian.cc[--j] = r_buf[i++];
-		sprintf(tmp_str, "/-show/showfile/snippet/%03d/name", endian.ii);
-		for (j = 0; j < Xsnippet_max; j++) {
-			if ((strcmp(tmp_str, Xsnippet[j].command)) == 0) {
-				// found name
-				if (Xsnippet[j].value.str) free(Xsnippet[j].value.str);
-				Xsnippet[j].value.str = NULL;
-				Xsnippet[j + 1].value.ii = 0; // No data
-				// update remote clients
-				s_len = Xfprint(s_buf, 0, Xsnippet[j].command, 's', Xsnippet[j].value.str);
-				Xsend(S_REM); // update xremote clients
-				// todo: this is not actually done here!
-				// hasdata should point to .data and not to .ii and a set of node commands should be saved
-				s_len = Xfprint(s_buf, 0, Xsnippet[j + 1].command, 'i', &zero);
-				Xsend(S_REM); // update xremote clients
-				// return OK status
-				s_len = Xsprint(s_buf, 0, 's', "/delete");
-				s_len = Xsprint(s_buf, s_len, 's', ",si");
-				s_len = Xsprint(s_buf, s_len, 's', "snippet");
-				s_len = Xsprint(s_buf, s_len, 'i', &one);
-				return S_SND;
-			}
-		}
-		// Not found, return NOK status
-		s_len = Xsprint(s_buf, 0, 's', "/delete");
-		s_len = Xsprint(s_buf, s_len, 's', ",si");
-		s_len = Xsprint(s_buf, s_len, 's', "snippet");
-		s_len = Xsprint(s_buf, s_len, 'i', &zero);
-		return S_SND;
-	}
-	if (strcmp(r_buf + 16, "libchan") == 0) {
-		i = 20;
-		// test... do nothing, just return OK status
-		s_len = Xsprint(s_buf, 0, 's', "/delete");
-		s_len = Xsprint(s_buf, s_len, 's', ",si");
-		s_len = Xsprint(s_buf, s_len, 's', "libchan");
-		s_len = Xsprint(s_buf, s_len, 'i', &one);
-		return S_SND;
-	}
-	return 0;
-}
-//
-// function_libs(): to manage /-libs commands
-int function_libs() {
-	printf("Doing nothing for /-libs\n");
-	fflush(stdout);
-	return 0;
-}
-//
-// function_showdump(): mamging /showdump requests
-int function_showdump() {
-char shname[32];
-
-	s_len = Xsprint(s_buf, 0, 's', "node");
-	s_len = Xsprint(s_buf, s_len, 's', ",s");
-	shname[0] = 0;
-	if (Xshow[4].value.str) strcpy(shname, Xshow[4].value.str);		//Xshow[4] holds the current show name
-	sprintf(r_buf, "/-show/showfile/show \"%s\" 0 0 0 0 0 0 0 0 0 0 \"%s\"", shname, XVERSION);
-	s_len = Xsprint(s_buf, s_len, 's', r_buf);
-	return S_SND;
-}
 //
 // Shutdown: a function (non Behringer standard) to save all current emulator values and
 // settings. Enables keeping data from one session to the next
@@ -5514,7 +5198,7 @@ int X32Shutdown() {
 	fclose(X32File);
 	printf(" Done\n");
 	fflush(stdout);
-	keep_on = 0;
+	if (x32_shutdown_quit) keep_on = 0;
 	return 0;
 }
 
@@ -5659,3 +5343,4 @@ int X32Init() {
 	fflush(stdout);
 	return 0;
 }
+#include "X32ShowData.c"
