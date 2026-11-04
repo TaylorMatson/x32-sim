@@ -10,13 +10,37 @@
  * Files live in ./x32data and are rewritten as OSC save/load/delete commands
  * arrive. A scene snapshot is the live engine (the desk does not upload a
  * blob: X32-Edit applies parameters, then /save copies them into a slot).
+ *
+ * With -d <folder>, that directory is the store instead: one console .shw,
+ * .scn scene files, and a snippets/ directory of .snp files. Recall applies
+ * the file's text lines; /save rewrites those same files in console format.
  */
 
 #define X32DATA "x32data"
+#define X32_PATHMAX 768
 
 int x32_scene_idx = 0;
 int x32_snippet_idx = 0;
 int x32_cue_idx = 0;
+
+static int x32_proj_on = 0;
+static int x32_unlink_bodies = 1;
+static char x32_proj_dir[X32_PATHMAX];
+static char x32_shw_path[X32_PATHMAX];
+static char x32_shw_tag[16];
+static char x32_shw_edit[64];
+static char x32_scene_path[100][X32_PATHMAX];
+static char x32_snip_path[100][X32_PATHMAX];
+static unsigned char x32_scene_listed[100];
+static unsigned char x32_snip_listed[100];
+
+static void x32_save_shw(void);
+static int x32_write_console_scene(int idx);
+static int x32_write_console_snip(int idx);
+static int x32_apply_console_file(const char *path, int safes, int idx);
+static void x32_load_project(void);
+static int x32_numbered(char *dst, int cap, const char *dir, const char *fmt,
+		int idx, const char *nm);
 
 static int x32_tag_at;
 static int x32_arg_at;
@@ -41,6 +65,15 @@ static void x32_copy_clean(char *dst, const char *src, int cap) {
 		dst[w++] = c;
 	}
 	dst[w] = 0;
+}
+
+static void x32_sanitize_file(char *s) {
+	if (!s) return;
+	for (; *s; s++) {
+		if (*s == '/' || *s == '\\' || *s == ':' || *s == '*' || *s == '?' ||
+				*s == '"' || *s == '<' || *s == '>' || *s == '|')
+			*s = '_';
+	}
 }
 
 static int x32_bit(int v, int b) {
@@ -202,6 +235,10 @@ static void x32_write_lstr(FILE *f, const char *s) {
 static void x32_save_show(void) {
 	FILE *f;
 	int i;
+	if (x32_proj_on) {
+		x32_save_shw();
+		return;
+	}
 	f = fopen(X32DATA "/show.txt.tmp", "w");
 	if (!f) return;
 	x32_write_lstr(f, Xshow[4].value.str);
@@ -228,6 +265,7 @@ static void x32_load_show(void) {
 
 static void x32_save_recall(void) {
 	FILE *f;
+	if (x32_proj_on) return;
 	f = fopen(X32DATA "/recall.txt.tmp", "w");
 	if (!f) return;
 	fprintf(f, "%d %d %d\n", x32_scene_idx, x32_snippet_idx, x32_cue_idx);
@@ -251,6 +289,10 @@ static void x32_load_recall(void) {
 static void x32_save_scenes_idx(void) {
 	FILE *f;
 	int n;
+	if (x32_proj_on) {
+		x32_save_shw();
+		return;
+	}
 	f = fopen(X32DATA "/scenes.idx.tmp", "w");
 	if (!f) return;
 	for (n = 0; n < 100; n++) {
@@ -290,6 +332,10 @@ static void x32_load_scenes_idx(void) {
 static void x32_save_snips_idx(void) {
 	FILE *f;
 	int n;
+	if (x32_proj_on) {
+		x32_save_shw();
+		return;
+	}
 	f = fopen(X32DATA "/snippets.idx.tmp", "w");
 	if (!f) return;
 	for (n = 0; n < 100; n++) {
@@ -336,6 +382,10 @@ static int x32_cue_used(X32command *p) {
 static void x32_save_cues_idx(void) {
 	FILE *f;
 	int n;
+	if (x32_proj_on) {
+		x32_save_shw();
+		return;
+	}
 	f = fopen(X32DATA "/cues.idx.tmp", "w");
 	if (!f) return;
 	for (n = 0; n < 500; n++) {
@@ -383,6 +433,7 @@ static void x32_save_libs_idx(void) {
 	FILE *f;
 	int kind, n;
 	const char *kn[] = {"ch", "fx", "rt"};
+	if (x32_proj_on) return;
 	f = fopen(X32DATA "/libs.idx.tmp", "w");
 	if (!f) return;
 	for (kind = 0; kind < 3; kind++) {
@@ -634,6 +685,7 @@ static int x32_write_scene_body(int idx) {
 	X32walk w;
 	char path[80], tmp[88];
 	FILE *f;
+	if (x32_proj_on) return x32_write_console_scene(idx);
 	sprintf(path, X32DATA "/scene/%03d.scn", idx);
 	sprintf(tmp, X32DATA "/scene/%03d.scn.tmp", idx);
 	f = fopen(tmp, "w");
@@ -654,6 +706,7 @@ static int x32_read_scene_body(int idx, int safes) {
 	X32walk w;
 	char path[80], line[64];
 	FILE *f;
+	if (x32_proj_on) return x32_apply_console_file(x32_scene_path[idx], safes, idx);
 	sprintf(path, X32DATA "/scene/%03d.scn", idx);
 	f = fopen(path, "r");
 	if (!f) return 0;
@@ -779,6 +832,7 @@ static int x32_save_scene(int idx, const char *name, const char *notes, int safe
 	if (have_safes) (p + 3)->value.ii = safes;
 	if (!x32_write_scene_body(idx)) return 0;
 	(p + 4)->value.ii = 1;
+	x32_scene_listed[idx] = 1;
 	x32_publish(p + 1);
 	x32_publish(p + 2);
 	x32_publish(p + 3);
@@ -794,6 +848,7 @@ static int x32_write_snip_body(int idx) {
 	char path[80], tmp[88];
 	FILE *f;
 	if (!p) return 0;
+	if (x32_proj_on) return x32_write_console_snip(idx);
 	sprintf(path, X32DATA "/snippet/%03d.snp", idx);
 	sprintf(tmp, X32DATA "/snippet/%03d.snp.tmp", idx);
 	f = fopen(tmp, "w");
@@ -874,6 +929,11 @@ static int x32_recall_snip(int idx) {
 	char path[80];
 	FILE *f;
 	if (!p || (p + 6)->value.ii == 0) return 0;
+	if (x32_proj_on) {
+		if (!x32_apply_console_file(x32_snip_path[idx], -1, idx)) return 0;
+		x32_note_recall(2, idx);
+		return 1;
+	}
 	sprintf(path, X32DATA "/snippet/%03d.snp", idx);
 	f = fopen(path, "r");
 	if (!f) return 0;
@@ -894,6 +954,7 @@ static int x32_save_snip(int idx, const char *name) {
 	x32_set_str(p + 1, nm);
 	if (!x32_write_snip_body(idx)) return 0;
 	(p + 6)->value.ii = 1;
+	x32_snip_listed[idx] = 1;
 	x32_publish(p + 1);
 	x32_publish(p + 6);
 	x32_save_snips_idx();
@@ -909,8 +970,14 @@ static void x32_clear_scene(int n) {
 	x32_set_str(p + 2, NULL);
 	(p + 3)->value.ii = 0;
 	(p + 4)->value.ii = 0;
-	sprintf(path, X32DATA "/scene/%03d.scn", n);
-	remove(path);
+	x32_scene_listed[n] = 0;
+	if (x32_proj_on) {
+		if (x32_unlink_bodies && x32_scene_path[n][0]) remove(x32_scene_path[n]);
+		x32_scene_path[n][0] = 0;
+	} else {
+		sprintf(path, X32DATA "/scene/%03d.scn", n);
+		remove(path);
+	}
 	x32_publish(p + 1);
 	x32_publish(p + 2);
 	x32_publish(p + 4);
@@ -922,8 +989,14 @@ static void x32_clear_snip(int n) {
 	if (!p) return;
 	x32_set_str(p + 1, NULL);
 	(p + 6)->value.ii = 0;
-	sprintf(path, X32DATA "/snippet/%03d.snp", n);
-	remove(path);
+	x32_snip_listed[n] = 0;
+	if (x32_proj_on) {
+		if (x32_unlink_bodies && x32_snip_path[n][0]) remove(x32_snip_path[n]);
+		x32_snip_path[n][0] = 0;
+	} else {
+		sprintf(path, X32DATA "/snippet/%03d.snp", n);
+		remove(path);
+	}
 	x32_publish(p + 1);
 	x32_publish(p + 6);
 }
@@ -939,6 +1012,7 @@ static int x32_save_lib_body(int kind, int idx, int source) {
 	FILE *f;
 	X32command *arr = NULL;
 	int nmax = 0;
+	if (x32_proj_on) return 0;
 	sprintf(path, "%s/%03d.pre", x32_lib_dir(kind), idx);
 	sprintf(tmp, "%s.tmp", path);
 	f = fopen(tmp, "w");
@@ -1076,12 +1150,36 @@ static int x32_copy_scene(int src, int dst) {
 	x32_set_str(b + 2, (a + 2)->value.str);
 	(b + 3)->value.ii = (a + 3)->value.ii;
 	(b + 4)->value.ii = (a + 4)->value.ii;
-	sprintf(ps, X32DATA "/scene/%03d.scn", src);
-	sprintf(pd, X32DATA "/scene/%03d.scn", dst);
-	if ((a + 4)->value.ii) {
-		if (!x32_copy_file(ps, pd)) (b + 4)->value.ii = 0;
+	if (x32_proj_on) {
+		if ((a + 4)->value.ii && x32_scene_path[src][0]) {
+			if (!x32_scene_path[dst][0]) {
+				char nm[64];
+				int okp;
+				x32_copy_clean(nm, (b + 1)->value.str, 60);
+				x32_sanitize_file(nm);
+				if (nm[0])
+					okp = x32_numbered(x32_scene_path[dst], X32_PATHMAX, x32_proj_dir, "%03d %.60s.scn", dst, nm);
+				else
+					okp = x32_numbered(x32_scene_path[dst], X32_PATHMAX, x32_proj_dir, "%03d.scn", dst, "");
+				if (!okp) x32_scene_path[dst][0] = 0;
+			}
+			if (!x32_copy_file(x32_scene_path[src], x32_scene_path[dst])) {
+				(b + 4)->value.ii = 0;
+				x32_scene_path[dst][0] = 0;
+			}
+		} else {
+			if (x32_unlink_bodies && x32_scene_path[dst][0]) remove(x32_scene_path[dst]);
+			x32_scene_path[dst][0] = 0;
+		}
+		x32_scene_listed[dst] = 1;
 	} else {
-		remove(pd);
+		sprintf(ps, X32DATA "/scene/%03d.scn", src);
+		sprintf(pd, X32DATA "/scene/%03d.scn", dst);
+		if ((a + 4)->value.ii) {
+			if (!x32_copy_file(ps, pd)) (b + 4)->value.ii = 0;
+		} else {
+			remove(pd);
+		}
 	}
 	x32_publish(b + 1);
 	x32_publish(b + 4);
@@ -1124,6 +1222,7 @@ static int x32_kind_of(const char *s) {
 
 static void x32_init_show(void) {
 	int n;
+	x32_unlink_bodies = 0;
 	x32_set_str(&Xshow[4], NULL);
 	for (n = 0; n < 10; n++) Xshow[5 + n].value.ii = 0;
 	Xshow[0].value.ii = 0;
@@ -1143,6 +1242,7 @@ static void x32_init_show(void) {
 	x32_scene_idx = 0;
 	x32_snippet_idx = 0;
 	x32_cue_idx = 0;
+	x32_unlink_bodies = 1;
 	x32_sync_lists();
 }
 
@@ -1262,14 +1362,1088 @@ void x32_log_osc(void) {
 	fflush(stdout);
 }
 
+/* ---- console project folder (-d <folder>) ---------------------------- */
+
+void x32_proj_set(const char *path) {
+	int n;
+	if (!path || !path[0]) return;
+	n = (int)strlen(path);
+	while (n > 1 && (path[n - 1] == '/' || path[n - 1] == '\\')) n--;
+	if (n >= X32_PATHMAX) n = X32_PATHMAX - 1;
+	memcpy(x32_proj_dir, path, n);
+	x32_proj_dir[n] = 0;
+	x32_proj_on = 1;
+	snprintf(x32_shw_tag, sizeof x32_shw_tag, "#4.0#");
+	snprintf(x32_shw_edit, sizeof x32_shw_edit, "%s", XVERSION);
+}
+
+static int x32_casecmp(const char *a, const char *b) {
+	if (!a) a = "";
+	if (!b) b = "";
+	while (*a && *b) {
+		unsigned char ca = (unsigned char)*a;
+		unsigned char cb = (unsigned char)*b;
+		if (ca >= 'A' && ca <= 'Z') ca = (unsigned char)(ca - 'A' + 'a');
+		if (cb >= 'A' && cb <= 'Z') cb = (unsigned char)(cb - 'A' + 'a');
+		if (ca != cb) return (int)ca - (int)cb;
+		a++;
+		b++;
+	}
+	return (int)(unsigned char)*a - (int)(unsigned char)*b;
+}
+
+static int x32_has_ext(const char *name, const char *ext) {
+	int n, m, i;
+	if (!name || !ext) return 0;
+	n = (int)strlen(name);
+	m = (int)strlen(ext);
+	if (n < m) return 0;
+	for (i = 0; i < m; i++) {
+		char a = name[n - m + i];
+		char b = ext[i];
+		if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+		if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+		if (a != b) return 0;
+	}
+	return 1;
+}
+
+static int x32_join(char *dst, int cap, const char *dir, const char *name) {
+	int na, nb;
+	if (!dst || cap < 2 || !dir || !name) return 0;
+	na = (int)strlen(dir);
+	nb = (int)strlen(name);
+	if (na + 1 + nb >= cap) return 0;
+	memcpy(dst, dir, na);
+	dst[na] = '/';
+	memcpy(dst + na + 1, name, nb);
+	dst[na + 1 + nb] = 0;
+	return 1;
+}
+
+/* Numbered scene/snippet names stay short so a long project path still fits. */
+static int x32_numbered(char *dst, int cap, const char *dir, const char *fmt,
+		int idx, const char *nm) {
+	char tail[96];
+	int n;
+	if (!nm) nm = "";
+	n = snprintf(tail, sizeof tail, fmt, idx, nm);
+	if (n < 0 || n >= (int)sizeof tail) return 0;
+	return x32_join(dst, cap, dir, tail);
+}
+
+static int x32_is_int_tok(const char *t) {
+	if (!t || !*t) return 0;
+	if (*t == '-' || *t == '+') t++;
+	if (*t < '0' || *t > '9') return 0;
+	while (*t) {
+		if (*t < '0' || *t > '9') return 0;
+		t++;
+	}
+	return 1;
+}
+
+static int x32_parse_bits(const char *t) {
+	int v = 0;
+	if (!t || !*t) return 0;
+	if (*t == '%') t++;
+	if (*t != '0' && *t != '1') return atoi(t);
+	while (*t == '0' || *t == '1') {
+		v = (v << 1) | (*t == '1');
+		t++;
+	}
+	return v;
+}
+
+static void x32_skip_ws(const char **pp) {
+	const char *p = *pp;
+	while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+	*pp = p;
+}
+
+static int x32_preview(const char *p, char *buf, int cap) {
+	int i = 0;
+	x32_skip_ws(&p);
+	if (!*p || cap < 2) {
+		if (cap) buf[0] = 0;
+		return 0;
+	}
+	if (*p == '"') {
+		p++;
+		while (*p && *p != '"' && i < cap - 1) buf[i++] = *p++;
+		buf[i] = 0;
+		return 1;
+	}
+	while (*p && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n' && i < cap - 1)
+		buf[i++] = *p++;
+	buf[i] = 0;
+	return 1;
+}
+
+static int x32_next_is_quote(const char *p) {
+	x32_skip_ws(&p);
+	return *p == '"';
+}
+
+static char *x32_tok(char **pp) {
+	char *p = *pp;
+	char *s;
+	while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+	if (!*p) {
+		*pp = p;
+		return NULL;
+	}
+	if (*p == '"') {
+		p++;
+		s = p;
+		while (*p && *p != '"') p++;
+		if (*p == '"') *p++ = 0;
+		*pp = p;
+		return s;
+	}
+	s = p;
+	while (*p && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n') p++;
+	if (*p) *p++ = 0;
+	*pp = p;
+	return s;
+}
+
+static int x32_slot_kind(const char *tok, const char *kind, int *idx) {
+	const char *p;
+	int v = 0;
+	if (!tok || !kind) return 0;
+	p = strstr(tok, kind);
+	if (!p) return 0;
+	if (p != tok && p[-1] != '/') return 0;
+	p += strlen(kind);
+	if (*p < '0' || *p > '9') return 0;
+	while (*p >= '0' && *p <= '9') {
+		v = v * 10 + (*p - '0');
+		p++;
+	}
+	if (*p) return 0;
+	*idx = v;
+	return 1;
+}
+
+static int x32_preview_is_slot(const char *p) {
+	char peek[96];
+	int idx;
+	if (!x32_preview(p, peek, sizeof peek)) return 0;
+	return x32_slot_kind(peek, "cue/", &idx) ||
+		x32_slot_kind(peek, "scene/", &idx) ||
+		x32_slot_kind(peek, "snippet/", &idx);
+}
+
+static const char *x32_take_name(char **pp) {
+	if (x32_preview_is_slot(*pp)) return "";
+	{
+		char *t = x32_tok(pp);
+		return t ? t : "";
+	}
+}
+
+static int x32_take_ints(char **pp, int *out, int maxn) {
+	int n = 0;
+	char peek[64];
+	while (n < maxn && x32_preview(*pp, peek, sizeof peek) && x32_is_int_tok(peek)) {
+		char *t = x32_tok(pp);
+		if (!t) break;
+		out[n++] = atoi(t);
+	}
+	return n;
+}
+
+static char *x32_read_all(const char *path) {
+	FILE *f;
+	long n;
+	char *b;
+	f = fopen(path, "rb");
+	if (!f) return NULL;
+	if (fseek(f, 0, SEEK_END) != 0) {
+		fclose(f);
+		return NULL;
+	}
+	n = ftell(f);
+	if (n < 0 || n > 2 * 1024 * 1024) {
+		fclose(f);
+		return NULL;
+	}
+	if (fseek(f, 0, SEEK_SET) != 0) {
+		fclose(f);
+		return NULL;
+	}
+	b = malloc((size_t)n + 1);
+	if (!b) {
+		fclose(f);
+		return NULL;
+	}
+	if (n && fread(b, 1, (size_t)n, f) != (size_t)n) {
+		free(b);
+		fclose(f);
+		return NULL;
+	}
+	b[n] = 0;
+	fclose(f);
+	return b;
+}
+
+static void x32_blank_catalog(void) {
+	int n;
+	x32_set_str(&Xshow[4], NULL);
+	for (n = 0; n < 10; n++) Xshow[5 + n].value.ii = 0;
+	for (n = 0; n < 100; n++) {
+		X32command *p = x32_scene_at(n);
+		if (p) {
+			x32_set_str(p + 1, NULL);
+			x32_set_str(p + 2, NULL);
+			(p + 3)->value.ii = 0;
+			(p + 4)->value.ii = 0;
+		}
+		p = x32_snip_at(n);
+		if (p) {
+			x32_set_str(p + 1, NULL);
+			(p + 2)->value.ii = 0;
+			(p + 3)->value.ii = 0;
+			(p + 4)->value.ii = 0;
+			(p + 5)->value.ii = 0;
+			(p + 6)->value.ii = 0;
+		}
+		x32_scene_path[n][0] = 0;
+		x32_snip_path[n][0] = 0;
+		x32_scene_listed[n] = 0;
+		x32_snip_listed[n] = 0;
+	}
+	for (n = 0; n < 500; n++) {
+		X32command *p = x32_cue_at(n);
+		if (!p) break;
+		(p + 1)->value.ii = 0;
+		x32_set_str(p + 2, NULL);
+		(p + 3)->value.ii = 0;
+		(p + 4)->value.ii = 0;
+		(p + 5)->value.ii = 0;
+		(p + 6)->value.ii = 0;
+		(p + 7)->value.ii = 0;
+		(p + 8)->value.ii = 0;
+		(p + 9)->value.ii = 0;
+	}
+}
+
+static void x32_parse_shw(char *buf) {
+	char *p = buf;
+	char *t;
+	if ((unsigned char)buf[0] == 0xEF && (unsigned char)buf[1] == 0xBB &&
+			(unsigned char)buf[2] == 0xBF)
+		p += 3;
+	while ((t = x32_tok(&p)) != NULL) {
+		int idx, nints, i;
+		int vals[8];
+		int slen = (int)strlen(t);
+		if (t[0] == '#' && slen >= 3 && t[slen - 1] == '#') {
+			char *name;
+			int ints[10];
+			if (slen < (int)sizeof x32_shw_tag)
+				snprintf(x32_shw_tag, sizeof x32_shw_tag, "%s", t);
+			name = x32_tok(&p);
+			if (name && x32_casecmp(name, "show") == 0) name = x32_tok(&p);
+			if (name) x32_set_str(&Xshow[4], name);
+			nints = x32_take_ints(&p, ints, 10);
+			for (i = 0; i < nints; i++) Xshow[5 + i].value.ii = ints[i];
+			if (x32_next_is_quote(p)) {
+				char *ed = x32_tok(&p);
+				if (ed) snprintf(x32_shw_edit, sizeof x32_shw_edit, "%s", ed);
+			}
+			continue;
+		}
+		if (x32_casecmp(t, "show") == 0) {
+			char *name = x32_tok(&p);
+			int ints[10];
+			if (name) x32_set_str(&Xshow[4], name);
+			nints = x32_take_ints(&p, ints, 10);
+			for (i = 0; i < nints; i++) Xshow[5 + i].value.ii = ints[i];
+			if (x32_next_is_quote(p)) {
+				char *ed = x32_tok(&p);
+				if (ed) snprintf(x32_shw_edit, sizeof x32_shw_edit, "%s", ed);
+			}
+			continue;
+		}
+		if (x32_slot_kind(t, "cue/", &idx) && idx >= 0 && idx < 500) {
+			X32command *c = x32_cue_at(idx);
+			const char *nm;
+			if (!c) continue;
+			nints = x32_take_ints(&p, vals, 1);
+			if (nints == 1) (c + 1)->value.ii = vals[0];
+			nm = x32_take_name(&p);
+			x32_set_str(c + 2, nm);
+			nints = x32_take_ints(&p, vals, 7);
+			for (i = 0; i < nints; i++) (c + 3 + i)->value.ii = vals[i];
+			continue;
+		}
+		if (x32_slot_kind(t, "scene/", &idx) && idx >= 0 && idx <= 99) {
+			X32command *c = x32_scene_at(idx);
+			const char *nm, *notes;
+			char peek[80];
+			if (!c) continue;
+			nm = x32_take_name(&p);
+			notes = x32_take_name(&p);
+			x32_set_str(c + 1, nm);
+			x32_set_str(c + 2, notes);
+			if (x32_preview(p, peek, sizeof peek)) {
+				if (peek[0] == '%') {
+					x32_tok(&p);
+					(c + 3)->value.ii = x32_parse_bits(peek);
+				} else if (x32_is_int_tok(peek)) {
+					x32_tok(&p);
+					(c + 3)->value.ii = atoi(peek);
+				}
+			}
+			nints = x32_take_ints(&p, vals, 1);
+			if (nints == 1) (c + 4)->value.ii = vals[0];
+			x32_scene_listed[idx] = 1;
+			continue;
+		}
+		if (x32_slot_kind(t, "snippet/", &idx) && idx >= 0 && idx <= 99) {
+			X32command *c = x32_snip_at(idx);
+			const char *nm;
+			if (!c) continue;
+			nm = x32_take_name(&p);
+			x32_set_str(c + 1, nm);
+			nints = x32_take_ints(&p, vals, 5);
+			for (i = 0; i < nints && i < 5; i++) (c + 2 + i)->value.ii = vals[i];
+			x32_snip_listed[idx] = 1;
+			continue;
+		}
+	}
+}
+
+static void x32_find_shw(void) {
+	const char *folder;
+	char want[X32_PATHMAX];
+	char chosen[X32_PATHMAX];
+	char chosen_name[X32_PATHMAX];
+	char exact[X32_PATHMAX];
+	int count = 0;
+	folder = strrchr(x32_proj_dir, '/');
+	folder = folder ? folder + 1 : x32_proj_dir;
+	want[0] = 0;
+	{
+		int nf = (int)strlen(folder);
+		if (nf + 4 < (int)sizeof want) {
+			memcpy(want, folder, nf);
+			memcpy(want + nf, ".shw", 5);
+		}
+	}
+	chosen[0] = 0;
+	chosen_name[0] = 0;
+	exact[0] = 0;
+#ifdef X32_HAS_DIRENT
+	{
+		DIR *d = opendir(x32_proj_dir);
+		struct dirent *de;
+		if (d) {
+			while ((de = readdir(d)) != NULL) {
+				char path[X32_PATHMAX];
+				struct stat st;
+				if (de->d_name[0] == '.') continue;
+				if (!x32_has_ext(de->d_name, ".shw")) continue;
+				if (!x32_join(path, sizeof path, x32_proj_dir, de->d_name)) continue;
+				if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+				count++;
+				if (x32_casecmp(de->d_name, want) == 0)
+					snprintf(exact, sizeof exact, "%s", path);
+				if (!chosen_name[0] || x32_casecmp(de->d_name, chosen_name) < 0) {
+					snprintf(chosen, sizeof chosen, "%s", path);
+					snprintf(chosen_name, sizeof chosen_name, "%s", de->d_name);
+				}
+			}
+			closedir(d);
+		}
+	}
+#endif
+	if (exact[0]) snprintf(x32_shw_path, sizeof x32_shw_path, "%s", exact);
+	else if (chosen[0]) snprintf(x32_shw_path, sizeof x32_shw_path, "%s", chosen);
+	else {
+		char base[X32_PATHMAX];
+		char file[X32_PATHMAX];
+		int nb = (int)strlen(folder);
+		if (nb >= (int)sizeof base) nb = (int)sizeof base - 1;
+		memcpy(base, folder, nb);
+		base[nb] = 0;
+		x32_sanitize_file(base);
+		if (!base[0]) memcpy(base, "show", 5);
+		nb = (int)strlen(base);
+		if (nb + 4 < (int)sizeof file) {
+			memcpy(file, base, nb);
+			memcpy(file + nb, ".shw", 5);
+			if (!x32_join(x32_shw_path, sizeof x32_shw_path, x32_proj_dir, file))
+				x32_shw_path[0] = 0;
+		} else {
+			x32_shw_path[0] = 0;
+		}
+	}
+	if (count > 1)
+		printf("X32 project: %d show files, using %s\n", count,
+			strrchr(x32_shw_path, '/') ? strrchr(x32_shw_path, '/') + 1 : x32_shw_path);
+	if (count == 0)
+		printf("X32 project: no .shw yet in %s\n", x32_proj_dir);
+}
+
+static void x32_stem(const char *base, char *stem, int cap) {
+	int n, i;
+	n = (int)strlen(base);
+	for (i = n - 1; i >= 0; i--) if (base[i] == '.') break;
+	if (i < 0) i = n;
+	if (i >= cap) i = cap - 1;
+	memcpy(stem, base, i);
+	stem[i] = 0;
+}
+
+static int x32_split_index(const char *stem, char *name, int cap) {
+	const char *p = stem;
+	const char *q;
+	const char *prefs[] = {"scene", "snippet", "scn", "snp", NULL};
+	int i, v;
+	name[0] = 0;
+	if (*p >= '0' && *p <= '9') {
+		v = 0;
+		q = p;
+		while (*q >= '0' && *q <= '9' && v < 100000) {
+			v = v * 10 + (*q - '0');
+			q++;
+		}
+		if (*q == 0) return v;
+		if (*q == ' ' || *q == '-' || *q == '_' || *q == '.') {
+			q++;
+			while (*q == ' ') q++;
+			snprintf(name, cap, "%s", q);
+			return v;
+		}
+	}
+	for (i = 0; prefs[i]; i++) {
+		int L = (int)strlen(prefs[i]);
+		if (strncmp(p, prefs[i], L) == 0 && p[L] >= '0' && p[L] <= '9') {
+			v = 0;
+			q = p + L;
+			while (*q >= '0' && *q <= '9' && v < 100000) {
+				v = v * 10 + (*q - '0');
+				q++;
+			}
+			if (*q == 0 || *q == ' ' || *q == '-' || *q == '_' || *q == '.') {
+				if (*q) q++;
+				while (*q == ' ') q++;
+				snprintf(name, cap, "%s", q);
+				return v;
+			}
+		}
+	}
+	{
+		int n = (int)strlen(stem);
+		i = n - 1;
+		while (i >= 0 && stem[i] >= '0' && stem[i] <= '9') i--;
+		if (i >= 0 && i < n - 1 && (stem[i] == '.' || stem[i] == '-' || stem[i] == '_')) {
+			v = atoi(stem + i + 1);
+			if (i >= cap) i = cap - 1;
+			memcpy(name, stem, i);
+			name[i] = 0;
+			return v;
+		}
+	}
+	snprintf(name, cap, "%s", stem);
+	return -1;
+}
+
+static int x32_path_taken(const char *path, int snippet) {
+	int i;
+	for (i = 0; i < 100; i++) {
+		const char *have = snippet ? x32_snip_path[i] : x32_scene_path[i];
+		if (have[0] && strcmp(have, path) == 0) return 1;
+	}
+	return 0;
+}
+
+static int x32_assign_body(int snippet, int idx, const char *path) {
+	char *dst;
+	if (idx < 0 || idx > 99 || !path || !path[0]) return 0;
+	if ((int)strlen(path) >= X32_PATHMAX) return 0;
+	if (snippet) {
+		if (!x32_snip_listed[idx] || x32_snip_path[idx][0]) return 0;
+		dst = x32_snip_path[idx];
+	} else {
+		if (!x32_scene_listed[idx] || x32_scene_path[idx][0]) return 0;
+		dst = x32_scene_path[idx];
+	}
+	if (x32_path_taken(path, snippet)) return 0;
+	memcpy(dst, path, strlen(path) + 1);
+	return 1;
+}
+
+static void x32_scan_dir(const char *dir, const char *ext, int snippet, int pass) {
+#ifdef X32_HAS_DIRENT
+	DIR *d;
+	struct dirent *de;
+	d = opendir(dir);
+	if (!d) return;
+	while ((de = readdir(d)) != NULL) {
+		char path[X32_PATHMAX];
+		char stem[256], name[256];
+		struct stat st;
+		int idx;
+		if (de->d_name[0] == '.') continue;
+		if (!x32_has_ext(de->d_name, ext)) continue;
+		if (!x32_join(path, sizeof path, dir, de->d_name)) continue;
+		if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+		if (x32_path_taken(path, snippet)) continue;
+		x32_stem(de->d_name, stem, sizeof stem);
+		idx = x32_split_index(stem, name, sizeof name);
+		if (pass == 0) {
+			if (idx >= 0 && idx <= 99) x32_assign_body(snippet, idx, path);
+		} else if (name[0]) {
+			int s;
+			for (s = 0; s < 100; s++) {
+				X32command *slot;
+				const char *slotn;
+				if (snippet) {
+					if (!x32_snip_listed[s] || x32_snip_path[s][0]) continue;
+					slot = x32_snip_at(s);
+				} else {
+					if (!x32_scene_listed[s] || x32_scene_path[s][0]) continue;
+					slot = x32_scene_at(s);
+				}
+				slotn = (slot && (slot + 1)->value.str) ? (slot + 1)->value.str : "";
+				if (slotn[0] && x32_casecmp(slotn, name) == 0) {
+					x32_assign_body(snippet, s, path);
+					break;
+				}
+			}
+		}
+	}
+	closedir(d);
+#else
+	(void)dir;
+	(void)ext;
+	(void)snippet;
+	(void)pass;
+#endif
+}
+
+static void x32_bind_files(int snippet) {
+	const char *subs_scn[] = {"", "scene", "Scene", "scenes", "Scenes", NULL};
+	const char *subs_snp[] = {"snippets", "Snippets", "snippet", "Snippet", "", NULL};
+	const char **subs = snippet ? subs_snp : subs_scn;
+	const char *ext = snippet ? ".snp" : ".scn";
+	int pass, si;
+	for (pass = 0; pass < 2; pass++) {
+		for (si = 0; subs[si]; si++) {
+			char dir[X32_PATHMAX];
+			if (subs[si][0]) {
+				if (!x32_join(dir, sizeof dir, x32_proj_dir, subs[si])) continue;
+			} else {
+				snprintf(dir, sizeof dir, "%s", x32_proj_dir);
+			}
+			x32_scan_dir(dir, ext, snippet, pass);
+		}
+	}
+}
+
+static void x32_mark_hasdata(void) {
+	int n;
+	for (n = 0; n < 100; n++) {
+		X32command *p;
+		if (!x32_scene_listed[n]) continue;
+		p = x32_scene_at(n);
+		if (!p) continue;
+		if (x32_scene_path[n][0]) (p + 4)->value.ii = 1;
+		else (p + 4)->value.ii = 0;
+	}
+	for (n = 0; n < 100; n++) {
+		X32command *p;
+		if (!x32_snip_listed[n]) continue;
+		p = x32_snip_at(n);
+		if (!p) continue;
+		if (x32_snip_path[n][0]) (p + 6)->value.ii = 1;
+		else (p + 6)->value.ii = 0;
+	}
+}
+
+static const char *x32_relpath(const char *path) {
+	int n;
+	if (!path || !path[0]) return "(no file)";
+	n = (int)strlen(x32_proj_dir);
+	if (n && strncmp(path, x32_proj_dir, n) == 0 && path[n] == '/') return path + n + 1;
+	return path;
+}
+
+static void x32_log_project(void) {
+	int n, ns = 0, np = 0, nc = 0;
+	const char *show = Xshow[4].value.str ? Xshow[4].value.str : "";
+	printf("X32 project: %s\n", x32_proj_dir);
+	printf("show \"%s\" from %s\n", show, x32_relpath(x32_shw_path));
+	for (n = 0; n < 500; n++) {
+		X32command *p = x32_cue_at(n);
+		if (p && x32_cue_used(p)) nc++;
+	}
+	for (n = 0; n < 100; n++) if (x32_scene_listed[n]) ns++;
+	for (n = 0; n < 100; n++) if (x32_snip_listed[n]) np++;
+	printf("cues: %d\n", nc);
+	for (n = 0; n < 500; n++) {
+		X32command *p = x32_cue_at(n);
+		if (!p || !x32_cue_used(p)) continue;
+		printf("  cue/%03d \"%s\"\n", n, (p + 2)->value.str ? (p + 2)->value.str : "");
+	}
+	printf("scenes: %d\n", ns);
+	for (n = 0; n < 100; n++) {
+		X32command *p;
+		if (!x32_scene_listed[n]) continue;
+		p = x32_scene_at(n);
+		printf("  scene/%03d \"%s\" <- %s\n", n,
+			(p && (p + 1)->value.str) ? (p + 1)->value.str : "",
+			x32_relpath(x32_scene_path[n]));
+	}
+	printf("snippets: %d\n", np);
+	for (n = 0; n < 100; n++) {
+		X32command *p;
+		if (!x32_snip_listed[n]) continue;
+		p = x32_snip_at(n);
+		printf("  snippet/%03d \"%s\" <- %s\n", n,
+			(p && (p + 1)->value.str) ? (p + 1)->value.str : "",
+			x32_relpath(x32_snip_path[n]));
+	}
+	fflush(stdout);
+}
+
+static void x32_load_project(void) {
+	char *buf;
+	struct stat st;
+	/* Drop names restored from .X32res.rc before the show file replaces them. */
+	x32_blank_catalog();
+	if (stat(x32_proj_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+		printf("X32 project folder not found: %s\n", x32_proj_dir);
+		fflush(stdout);
+		return;
+	}
+	x32_find_shw();
+	buf = x32_read_all(x32_shw_path);
+	if (buf) {
+		x32_parse_shw(buf);
+		free(buf);
+	}
+	x32_bind_files(0);
+	x32_bind_files(1);
+	x32_mark_hasdata();
+	x32_log_project();
+}
+
+static void x32_save_shw(void) {
+	char tmp[X32_PATHMAX];
+	FILE *f;
+	int n, i;
+	char qshow[160], qedit[80], qname[160], qnotes[160], bits[16];
+	if (!x32_proj_on || !x32_shw_path[0]) return;
+	if ((int)strlen(x32_shw_path) + 5 >= (int)sizeof tmp) return;
+	{
+		int np = (int)strlen(x32_shw_path);
+		memcpy(tmp, x32_shw_path, np);
+		memcpy(tmp + np, ".tmp", 5);
+	}
+	f = fopen(tmp, "w");
+	if (!f) {
+		printf("X32 project: cannot write %s\n", x32_shw_path);
+		return;
+	}
+	if (!x32_shw_tag[0]) snprintf(x32_shw_tag, sizeof x32_shw_tag, "#4.0#");
+	if (!x32_shw_edit[0]) snprintf(x32_shw_edit, sizeof x32_shw_edit, "%s", XVERSION);
+	x32_qstr(qshow, sizeof qshow, Xshow[4].value.str);
+	x32_qstr(qedit, sizeof qedit, x32_shw_edit);
+	fprintf(f, "%s show %s", x32_shw_tag, qshow);
+	for (i = 0; i < 10; i++) fprintf(f, " %d", Xshow[5 + i].value.ii);
+	fprintf(f, " %s\n", qedit);
+	for (n = 0; n < 500; n++) {
+		X32command *p = x32_cue_at(n);
+		if (!p || !x32_cue_used(p)) continue;
+		x32_qstr(qname, sizeof qname, (p + 2)->value.str);
+		fprintf(f, "cue/%03d %d %s %d %d %d %d %d %d %d\n",
+			n, (p + 1)->value.ii, qname,
+			(p + 3)->value.ii, (p + 4)->value.ii, (p + 5)->value.ii,
+			(p + 6)->value.ii, (p + 7)->value.ii, (p + 8)->value.ii,
+			(p + 9)->value.ii);
+	}
+	for (n = 0; n < 100; n++) {
+		X32command *p = x32_scene_at(n);
+		int named;
+		if (!p) break;
+		named = (p + 1)->value.str && (p + 1)->value.str[0];
+		if (!x32_scene_listed[n] && !named && !(p + 4)->value.ii) continue;
+		x32_qstr(qname, sizeof qname, (p + 1)->value.str);
+		x32_qstr(qnotes, sizeof qnotes, (p + 2)->value.str);
+		x32_bits9(bits, (p + 3)->value.ii);
+		fprintf(f, "scene/%03d %s %s %s %d\n", n, qname, qnotes, bits, (p + 4)->value.ii);
+	}
+	for (n = 0; n < 100; n++) {
+		X32command *p = x32_snip_at(n);
+		int named;
+		if (!p) break;
+		named = (p + 1)->value.str && (p + 1)->value.str[0];
+		if (!x32_snip_listed[n] && !named && !(p + 6)->value.ii) continue;
+		x32_qstr(qname, sizeof qname, (p + 1)->value.str);
+		fprintf(f, "snippet/%03d %s %d %d %d %d %d\n",
+			n, qname, (p + 2)->value.ii, (p + 3)->value.ii, (p + 4)->value.ii,
+			(p + 5)->value.ii, (p + 6)->value.ii);
+	}
+	fclose(f);
+	x32_commit(x32_shw_path, tmp);
+}
+
+static int x32_param_type(X32command *c) {
+	int s, nmax, i;
+	if (!c) return I32;
+	if (c->format.typ != FX32) return c->format.typ;
+	for (s = 0; s < 8; s++) {
+		nmax = (s == 0) ? Xfx1_max : ((s < 4) ? Xfx2_max : Xfx5_max);
+		if (c >= Xfxset[s] && c < Xfxset[s] + nmax) {
+			i = (int)(c - Xfxset[s]);
+			return FXc_lookup(Xfxset[s], i);
+		}
+	}
+	return F32;
+}
+
+static void x32_apply_one(X32command *c, const char *text) {
+	int typ, changed = 0, n = 0;
+	char tok[160];
+	const char *p = text ? text : "";
+	while (*p == ' ' || *p == '\t') p++;
+	if (*p == '"') {
+		const char *e;
+		p++;
+		e = strchr(p, '"');
+		if (!e) e = p + strlen(p);
+		n = (int)(e - p);
+		if (n > (int)sizeof tok - 1) n = (int)sizeof tok - 1;
+		memcpy(tok, p, n);
+		tok[n] = 0;
+	} else {
+		while (p[n] && p[n] != ' ' && p[n] != '\t' && p[n] != '\n' && p[n] != '\r' &&
+				n < (int)sizeof tok - 1) {
+			tok[n] = p[n];
+			n++;
+		}
+		tok[n] = 0;
+	}
+	typ = x32_param_type(c);
+	if (typ == S32) {
+		const char *cur = c->value.str ? c->value.str : "";
+		if (strcmp(cur, tok) != 0) {
+			x32_set_str(c, tok);
+			changed = 1;
+			s_len = Xfprint(s_buf, 0, c->command, 's', c->value.str ? c->value.str : "");
+		}
+	} else if (typ == F32) {
+		float f = 0;
+		if (!tok[0]) return;
+		if (strcmp(tok, "-oo") == 0 || strcmp(tok, "-inf") == 0) f = 0;
+		else sscanf(tok, "%f", &f);
+		if (f < c->value.ff - EPSILON || f > c->value.ff + EPSILON) {
+			c->value.ff = f;
+			changed = 1;
+			s_len = Xfprint(s_buf, 0, c->command, 'f', &c->value.ff);
+		}
+	} else if (typ == E32 && c->node) {
+		int j = 0, found = -1;
+		if (!tok[0]) return;
+		while (c->node[j] && c->node[j][0]) {
+			const char *nm = c->node[j];
+			while (*nm == ' ') nm++;
+			if (x32_casecmp(nm, tok) == 0) {
+				found = j;
+				break;
+			}
+			j++;
+		}
+		if (found >= 0 && c->value.ii != found) {
+			c->value.ii = found;
+			changed = 1;
+			s_len = Xfprint(s_buf, 0, c->command, 'i', &c->value.ii);
+		}
+	} else {
+		int v = 0;
+		if (!tok[0]) return;
+		if (tok[0] == '%') v = x32_parse_bits(tok);
+		else sscanf(tok, "%d", &v);
+		if (c->value.ii != v) {
+			c->value.ii = v;
+			changed = 1;
+			s_len = Xfprint(s_buf, 0, c->command, 'i', &c->value.ii);
+		}
+	}
+	if (changed) Xsend(S_REM);
+}
+
+static void x32_slash_line(const char *line) {
+	char rb[BSIZE];
+	char sb[BSIZE];
+	int rl = r_len, sl = s_len;
+	memcpy(rb, r_buf, BSIZE);
+	memcpy(sb, s_buf, BSIZE);
+	memset(r_buf, 0, BSIZE);
+	r_len = Xsprint(r_buf, 0, 's', "/");
+	r_len = Xsprint(r_buf, r_len, 's', ",s");
+	r_len = Xsprint(r_buf, r_len, 's', (char *)line);
+	function_slash();
+	memcpy(r_buf, rb, BSIZE);
+	memcpy(s_buf, sb, BSIZE);
+	r_len = rl;
+	s_len = sl;
+}
+
+static void x32_apply_console_line(char *line, int safes, int idx) {
+	char path[192];
+	char *p = line;
+	int n = 0;
+	X32command *c;
+	while (*p == ' ' || *p == '\t') p++;
+	if (*p == 0 || *p == '#' || *p == '\n' || *p == '\r') return;
+	if (*p != '/') return;
+	while (p[n] && p[n] != ' ' && p[n] != '\t' && p[n] != '\n' && p[n] != '\r' &&
+			n < (int)sizeof path - 1) {
+		path[n] = p[n];
+		n++;
+	}
+	path[n] = 0;
+	if (safes >= 0 && x32_scene_skip(path, safes, idx)) return;
+	c = x32_find_param(path);
+	if (c && !(c->flags & F_FND)) {
+		x32_apply_one(c, p + n);
+		return;
+	}
+	{
+		int L = (int)strlen(p);
+		while (L > 0 && (p[L - 1] == '\n' || p[L - 1] == '\r')) p[--L] = 0;
+		/* Leave room for the OSC address and type tag function_slash expects. */
+		if (L <= 0 || L >= BSIZE - 64) return;
+		x32_slash_line(p);
+	}
+}
+
+static int x32_apply_console_file(const char *path, int safes, int idx) {
+	FILE *f;
+	char line[8192];
+	if (!path || !path[0]) return 0;
+	f = fopen(path, "r");
+	if (!f) return 0;
+	while (fgets(line, sizeof line, f)) x32_apply_console_line(line, safes, idx);
+	fclose(f);
+	return 1;
+}
+
+static int x32_write_grouped(FILE *f, X32command *node) {
+	char rb[BSIZE], sb[BSIZE], arg[192];
+	int rl = r_len, sl = s_len, ok = 0;
+	const char *path = node->command ? node->command : "";
+	if (path[0] == '/') path++;
+	if ((int)strlen(path) >= (int)sizeof arg) return 0;
+	memcpy(rb, r_buf, BSIZE);
+	memcpy(sb, s_buf, BSIZE);
+	snprintf(arg, sizeof arg, "%s", path);
+	memset(r_buf, 0, BSIZE);
+	r_len = Xsprint(r_buf, 0, 's', "/node");
+	r_len = Xsprint(r_buf, r_len, 's', ",s");
+	r_len = Xsprint(r_buf, r_len, 's', arg);
+	s_len = 0;
+	s_buf[0] = 0;
+	if (function_node() == S_SND && s_len > 12 && s_len < BSIZE && s_buf[12] == '/') {
+		char *text = s_buf + 12;
+		int L = (int)strlen(text);
+		while (L > 0 && (text[L - 1] == '\n' || text[L - 1] == '\r')) text[--L] = 0;
+		/* A line that will not fit back through function_slash is not written,
+		 * so the caller falls back to one parameter per line. */
+		if (L > 0 && text[0] == '/' && L < BSIZE - 64) {
+			fprintf(f, "%s\n", text);
+			ok = 1;
+		}
+	}
+	memcpy(r_buf, rb, BSIZE);
+	memcpy(s_buf, sb, BSIZE);
+	r_len = rl;
+	s_len = sl;
+	return ok;
+}
+
+static void x32_write_one_line(FILE *f, X32command *c) {
+	int typ = x32_param_type(c);
+	fprintf(f, "%s", c->command);
+	if (typ == S32) {
+		char q[160];
+		x32_qstr(q, sizeof q, c->value.str);
+		fprintf(f, " %s\n", q);
+		return;
+	}
+	if (typ == E32 && c->node && c->value.ii >= 0 && c->node[c->value.ii] && c->node[c->value.ii][0]) {
+		const char *nm = c->node[c->value.ii];
+		while (*nm == ' ') nm++;
+		fprintf(f, " %s\n", nm);
+		return;
+	}
+	if (typ == F32) {
+		fprintf(f, " %.8g\n", c->value.ff);
+		return;
+	}
+	fprintf(f, " %d\n", c->value.ii);
+}
+
+typedef struct {
+	FILE *f;
+	int snippet;
+	int ev, ch, ax, mg;
+	int lines;
+} X32cons;
+
+static void x32_console_arr(X32command *a, int n, void *v) {
+	X32cons *w = (X32cons *)v;
+	int i = 0;
+	while (i < n) {
+		int j, k, kids, any, all;
+		if (!(a[i].flags & F_FND) || (i + 1 < n && (a[i + 1].flags & F_FND))) {
+			i++;
+			continue;
+		}
+		j = i + 1;
+		while (j < n && !(a[j].flags & F_FND)) j++;
+		kids = j - (i + 1);
+		any = 0;
+		all = 1;
+		if (w->snippet) {
+			for (k = i + 1; k < j; k++) {
+				if (x32_snip_keep(a[k].command, w->ev, w->ch, w->ax, w->mg)) any = 1;
+				else all = 0;
+			}
+			if (!any) {
+				i = j;
+				continue;
+			}
+		} else if (kids <= 0) {
+			i = j;
+			continue;
+		}
+		if (kids > 0 && all &&
+				(int)strlen(a[i].command) + kids * 32 < BSIZE - 64 &&
+				x32_write_grouped(w->f, &a[i])) {
+			w->lines++;
+			i = j;
+			continue;
+		}
+		for (k = i + 1; k < j; k++) {
+			if (w->snippet && !x32_snip_keep(a[k].command, w->ev, w->ch, w->ax, w->mg))
+				continue;
+			x32_write_one_line(w->f, &a[k]);
+			w->lines++;
+		}
+		i = j;
+	}
+}
+
+static int x32_write_console_scene(int idx) {
+	X32command *p = x32_scene_at(idx);
+	X32cons w;
+	char tmp[X32_PATHMAX];
+	FILE *f;
+	char qn[160], qt[160], bits[16];
+	if (!p) return 0;
+	if (!x32_scene_path[idx][0]) {
+		char nm[64];
+		int okp;
+		x32_copy_clean(nm, (p + 1)->value.str, 60);
+		x32_sanitize_file(nm);
+		if (nm[0])
+			okp = x32_numbered(x32_scene_path[idx], X32_PATHMAX, x32_proj_dir, "%03d %.60s.scn", idx, nm);
+		else
+			okp = x32_numbered(x32_scene_path[idx], X32_PATHMAX, x32_proj_dir, "%03d.scn", idx, "");
+		if (!okp) return 0;
+	}
+	if ((int)strlen(x32_scene_path[idx]) + 5 >= (int)sizeof tmp) return 0;
+	{
+		int np = (int)strlen(x32_scene_path[idx]);
+		memcpy(tmp, x32_scene_path[idx], np);
+		memcpy(tmp + np, ".tmp", 5);
+	}
+	f = fopen(tmp, "w");
+	if (!f) {
+		printf("X32 project: cannot write %s\n", x32_scene_path[idx]);
+		return 0;
+	}
+	if (!x32_shw_tag[0]) snprintf(x32_shw_tag, sizeof x32_shw_tag, "#4.0#");
+	x32_qstr(qn, sizeof qn, (p + 1)->value.str);
+	x32_qstr(qt, sizeof qt, (p + 2)->value.str);
+	x32_bits9(bits, (p + 3)->value.ii);
+	fprintf(f, "%s %s %s %s 1\n", x32_shw_tag, qn, qt, bits);
+	w.f = f;
+	w.snippet = 0;
+	w.ev = w.ch = w.ax = w.mg = 0;
+	w.lines = 0;
+	x32_for_engine(x32_console_arr, &w);
+	fclose(f);
+	x32_commit(x32_scene_path[idx], tmp);
+	return 1;
+}
+
+static int x32_write_console_snip(int idx) {
+	X32command *p = x32_snip_at(idx);
+	X32cons w;
+	char tmp[X32_PATHMAX];
+	char sub[X32_PATHMAX];
+	FILE *f;
+	char qn[160];
+	if (!p) return 0;
+	if (!x32_snip_path[idx][0]) {
+		char nm[64];
+		int okp;
+		if (!x32_join(sub, sizeof sub, x32_proj_dir, "snippets")) return 0;
+		x32_mkdir(sub);
+		x32_copy_clean(nm, (p + 1)->value.str, 60);
+		x32_sanitize_file(nm);
+		if (nm[0])
+			okp = x32_numbered(x32_snip_path[idx], X32_PATHMAX, sub, "%03d %.60s.snp", idx, nm);
+		else
+			okp = x32_numbered(x32_snip_path[idx], X32_PATHMAX, sub, "%03d.snp", idx, "");
+		if (!okp) return 0;
+	}
+	if ((int)strlen(x32_snip_path[idx]) + 5 >= (int)sizeof tmp) return 0;
+	{
+		int np = (int)strlen(x32_snip_path[idx]);
+		memcpy(tmp, x32_snip_path[idx], np);
+		memcpy(tmp + np, ".tmp", 5);
+	}
+	f = fopen(tmp, "w");
+	if (!f) {
+		printf("X32 project: cannot write %s\n", x32_snip_path[idx]);
+		return 0;
+	}
+	if (!x32_shw_tag[0]) snprintf(x32_shw_tag, sizeof x32_shw_tag, "#4.0#");
+	x32_qstr(qn, sizeof qn, (p + 1)->value.str);
+	fprintf(f, "%s %s %d %d %d %d 1\n", x32_shw_tag, qn,
+		(p + 2)->value.ii, (p + 3)->value.ii, (p + 4)->value.ii, (p + 5)->value.ii);
+	w.f = f;
+	w.snippet = 1;
+	w.ev = (p + 2)->value.ii;
+	w.ch = (p + 3)->value.ii;
+	w.ax = (p + 4)->value.ii;
+	w.mg = (p + 5)->value.ii;
+	w.lines = 0;
+	x32_for_engine(x32_console_arr, &w);
+	fclose(f);
+	x32_commit(x32_snip_path[idx], tmp);
+	return 1;
+}
+
 void x32_data_init(void) {
 	int n, k;
-	x32_mkdir(X32DATA);
-	x32_mkdir(X32DATA "/scene");
-	x32_mkdir(X32DATA "/snippet");
-	x32_mkdir(X32DATA "/libch");
-	x32_mkdir(X32DATA "/libfx");
-	x32_mkdir(X32DATA "/librt");
+	if (!x32_proj_on) {
+		x32_mkdir(X32DATA);
+		x32_mkdir(X32DATA "/scene");
+		x32_mkdir(X32DATA "/snippet");
+		x32_mkdir(X32DATA "/libch");
+		x32_mkdir(X32DATA "/libfx");
+		x32_mkdir(X32DATA "/librt");
+	}
 	if (strcmp(Xscene[2].command, "/-show/showfile/scene/000/name") != 0)
 		printf("X32 show layout: scene 000 name is not where save expects it\n");
 	if (strcmp(Xsnippet[2].command, "/-show/showfile/snippet/000/name") != 0)
@@ -1292,6 +2466,10 @@ void x32_data_init(void) {
 			X32command *p = x32_lib_at(k, n);
 			if (p && (p + 1)->value.ii == 0) (p + 1)->value.ii = n + 1;
 		}
+	}
+	if (x32_proj_on) {
+		x32_load_project();
+		return;
 	}
 	x32_load_show();
 	x32_load_scenes_idx();

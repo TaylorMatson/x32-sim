@@ -39,6 +39,8 @@
 // 0.88: Fix for /meters/5 and /meter/6 timefactor control
 // 0.89: show, scene, snippet and library retention under ./x32data
 //       (save/load/delete/copy/add, /-show, /-action, /-libs, /showdump)
+// 0.90: -d <folder> reads an X32-Edit/console project in place
+//       (.shw, .scn, snippets/*.snp). -d 0/1 remains the debug switch.
 //
 #ifdef __WIN32__
 #include <windows.h>
@@ -69,10 +71,14 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <time.h>
+#if !defined(__WIN32__) || defined(__MINGW32__) || defined(__MINGW64__)
+#include <dirent.h>
+#define X32_HAS_DIRENT 1
+#endif
 
 #define EPSILON 0.0001	// epsilon for float comparisons
 #define XVERSION "4.06"	// FW version
-#define BSIZE 512		// Buffer sizes
+#define BSIZE 4096		// Buffer sizes (scene node lines, FX parameter blocks)
 #define X32DEBUG 0		// default debug mode
 #define X32VERBOSE 1	// default verbose mode
 #define VERB_REMOTE 0	// if verbose: default /xremote verbose
@@ -295,6 +301,7 @@ int function_libs();
 int function_showdump();
 int function();
 void x32_data_init(void);
+void x32_proj_set(const char *path);
 void x32_log_osc(void);
 int x32_stat_index(void);
 void x32_action_hook(void);
@@ -899,7 +906,15 @@ int main(int argc, char **argv) {
 			Xif_str[31] = 0;
 			break;
 		case 'd':
-			sscanf(optarg, "%d", &Xdebug);
+			/* -d 0 / -d 1 keep Patrick's debug switch. Any other
+			 * argument is an X32 project folder (paths may contain spaces;
+			 * the shell passes the quoted path as one argument). */
+			if (optarg && optarg[0] && optarg[1] == 0 &&
+					(optarg[0] == '0' || optarg[0] == '1')) {
+				Xdebug = optarg[0] - '0';
+			} else {
+				x32_proj_set(optarg);
+			}
 			break;
 		case 'v':
 			sscanf(optarg, "%d", &Xverbose);
@@ -924,6 +939,8 @@ int main(int argc, char **argv) {
 			printf("usage: X32 [-i <IP address>] - default: first non-loopback IPv4\n");
 			printf("           [-e <interface>] - default: first non-loopback (macOS often en0)\n");
 			printf(" [-d 0/1, debug option] - default: 0\n");
+			printf(" [-d <folder>, X32 project: .shw .scn snippets/*.snp]\n");
+			printf("     Quote paths that contain spaces. -d 0 and -d 1 stay the debug switch.\n");
 			printf(" [-v 0/1, verbose option] - default: 1\n");
 			printf(" The options below apply in conjunction with -v 1\n");
 			printf("     [-x 0/1, echoes incoming verbose for /xremote] - default: 0\n");
@@ -961,7 +978,7 @@ int main(int argc, char **argv) {
 #endif
 //
 	r_len = 0;
-	printf("X32 - v0.89 - An X32 Emulator - (c)2014-2019 Patrick-Gilles Maillot\n");
+	printf("X32 - v0.90 - An X32 Emulator - (c)2014-2019 Patrick-Gilles Maillot\n");
 	//
 	// Get or use IP address
 	if (noIP) {
