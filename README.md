@@ -316,7 +316,7 @@ gcc -O2 -o X32 X32.c X32lib/Xsprint.c X32lib/Xdump.c -lm
 ./X32 -e en0          # macOS: pick an interface instead of the first IPv4 address
 ```
 
-The emulator listens on UDP port 10023. Point X32-Edit (or any OSC client) at that address. On macOS the idle loop sleeps, and `-i` / `-e` choose the bind address or interface (`en0` is typical; `-e` is the name from `ifconfig`). Every incoming OSC packet is printed on one line (`OSC /save ,siss scene`).
+The emulator listens on UDP port 10023. Point X32-Edit (or any OSC client) at that address. On macOS the idle loop sleeps, and `-i` / `-e` choose the bind address or interface (`en0` is typical; `-e` is the name from `ifconfig`). `/xinfo` and `/status` report that same address. X32-Edit stays disconnected when those replies name a different IP than the one it opened, so pass `-i` as the address you type into X32-Edit (`-i 127.0.0.1` when the editor is on this machine). Every incoming OSC packet is printed on one line (`OSC /save ,siss scene`).
 
 #### Shows, scenes, and snippets
 
@@ -356,7 +356,9 @@ Pass `-d` a directory and the emulator uses that folder as the store. There is n
 ./X32 -i 127.0.0.1 -d "/Volumes/JetDrive 1TB/Cumberland/Theater Department/Into the Woods/ITW-X32-Draft"
 ```
 
-The folder is the X32-Edit/console layout: one `.shw`, one or more `.scn` files, and a `snippets/` directory of `.snp` files. A show file starts with a `#4.0#` header (older `#2.1#` headers are accepted too) and then `show`, `cue/NNN`, `scene/NNN`, and `snippet/NNN` lines. On start the emulator parses the show and maps each scene and snippet slot to a file by index (`001 Finale.scn`, `012-Band.snp`, `ITW-X32-Draft.002.scn`) or by name (`Act I.scn`, `Quiet Stage.snp`). Snippets are looked up in `snippets/` first. Startup prints the project path, the show name, and the cue, scene, and snippet counts and names, including a slot whose file is missing.
+The folder is the X32-Edit/console layout: one `.shw`, one or more `.scn` files, and a `snippets/` directory of `.snp` files. A show file starts with a `#4.0#` header (older `#2.1#` headers are accepted too) and then `show`, `cue/NNN`, `scene/NNN`, and `snippet/NNN` lines. On start the emulator parses the show and maps each scene and snippet slot to a file. Index in the file name wins (`001 Finale.scn`, `012-Band.snp`, `ITW-X32-Draft.002.scn`). Otherwise the name is compared case-insensitively with spaces, hyphens, and underscores ignored, so `ITW-Base.scn` attaches to scene `"ITW Base"`. If that still misses, the quoted name in the file's own `#4.0#` header is used the same way. Snippets are looked up in `snippets/` first. Startup prints the project path, the show name, and the cue, scene, and snippet counts and names, including a slot whose file is missing.
+
+X32-Edit 4.3 fills the Cues view from `/showdump` (and from `/node ,s -show/showfile/show` plus `/node ,s -show/showfile/cue` or `/node ,s -show/showfile/cue/NNN`). Those replies are the firmware 4.x `node` lines: the show name and its ten safe integers, then one line per cue, scene, and snippet. Until that dump arrives the editor keeps its built-in show name `MyShow` and an empty cue list. Scenes and snippets use the same lines.
 
 `/load` applies that file's text lines to the live mixer (a grouped node line such as `/ch/01/config "Baker" 3 GN 1`, or a single parameter such as `/ch/01/mix/fader 0.250`). `/save` rewrites the same file in console format and updates the `.shw` in place. A scene or snippet that does not yet have a file is created as `NNN name.scn` or `snippets/NNN name.snp`. `/delete` removes the mapped file. `/-action/initshow` clears the catalog and rewrites the `.shw` without deleting the `.scn` and `.snp` files.
 

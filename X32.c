@@ -299,6 +299,7 @@ int function_misc();
 int function_renew();
 int function_libs();
 int function_showdump();
+int x32_show_node(const char *req);
 int function();
 void x32_data_init(void);
 void x32_proj_set(const char *path);
@@ -3117,8 +3118,9 @@ int function_xinfo() {
 //
 // /status command
 int function_status() {
-	getmyIP(); // get my IP in r_buf
-
+	/* Report the address we bound (-i, -e, or the startup choice).
+	 * getmyIP() would replace that with another interface, and X32-Edit
+	 * treats a mismatched /xinfo or /status address as disconnected. */
 	s_len = Xsprint(s_buf, 0, 's', "/status");
 	s_len = Xsprint(s_buf, s_len, 's', ",sss");
 	s_len = Xsprint(s_buf, s_len, 's', "active");
@@ -3831,6 +3833,9 @@ int function_node() {
 	// reply with node~~~~,s~~/[string] <data>...\n
 	cmd_max = 0;
 	str_pt_in = r_buf + 12;				// data block starts at index 12
+	/* Show catalog parents (/ -show, cue, scene, snippet) answer with one
+	 * node packet per slot, the way firmware 4.x answers /showdump. */
+	if (x32_show_node(str_pt_in)) return 0;
 	for (i = 0; i < Xnode_max; i++) {
 		if (strncmp(Xnode[i].command, str_pt_in, Xnode[i].nchars) == 0) {
 			cmd_max = Xnode[i].cmd_max;

@@ -1877,6 +1877,65 @@ static int x32_assign_body(int snippet, int idx, const char *path) {
 	return 1;
 }
 
+/* "ITW Base", "ITW-Base" and "itw_base" are the same show name. */
+static void x32_fold_name(const char *s, char *dst, int cap) {
+	int w = 0;
+	if (!s) s = "";
+	while (*s && w < cap - 1) {
+		unsigned char c = (unsigned char)*s++;
+		if (c == ' ' || c == '-' || c == '_' || c == '\t') continue;
+		if (c >= 'A' && c <= 'Z') c = (unsigned char)(c - 'A' + 'a');
+		dst[w++] = (char)c;
+	}
+	dst[w] = 0;
+}
+
+static int x32_fold_eq(const char *a, const char *b) {
+	char fa[256], fb[256];
+	x32_fold_name(a, fa, sizeof fa);
+	x32_fold_name(b, fb, sizeof fb);
+	if (!fa[0] || !fb[0]) return 0;
+	return strcmp(fa, fb) == 0;
+}
+
+/* First quoted name on a #4.0# / #2.1# header line. */
+static int x32_header_name(const char *path, char *dst, int cap) {
+	FILE *f;
+	char buf[512];
+	char *p, *q;
+	int n, guard;
+	if (!path || !dst || cap < 2) return 0;
+	dst[0] = 0;
+	f = fopen(path, "r");
+	if (!f) return 0;
+	for (guard = 0; guard < 4; guard++) {
+		if (!fgets(buf, sizeof buf, f)) break;
+		p = buf;
+		if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB &&
+				(unsigned char)p[2] == 0xBF)
+			p += 3;
+		while (*p == ' ' || *p == '\t') p++;
+		if (*p == '#' ) {
+			q = strchr(p + 1, '#');
+			if (!q) continue;
+			p = q + 1;
+			while (*p == ' ' || *p == '\t') p++;
+		}
+		if (*p != '"') continue;
+		p++;
+		q = strchr(p, '"');
+		if (!q) continue;
+		n = (int)(q - p);
+		if (n >= cap) n = cap - 1;
+		memcpy(dst, p, n);
+		dst[n] = 0;
+		fclose(f);
+		return dst[0] != 0;
+	}
+	fclose(f);
+	return 0;
+}
+
 static void x32_scan_dir(const char *dir, const char *ext, int snippet, int pass) {
 #ifdef X32_HAS_DIRENT
 	DIR *d;
@@ -1897,7 +1956,7 @@ static void x32_scan_dir(const char *dir, const char *ext, int snippet, int pass
 		idx = x32_split_index(stem, name, sizeof name);
 		if (pass == 0) {
 			if (idx >= 0 && idx <= 99) x32_assign_body(snippet, idx, path);
-		} else if (name[0]) {
+		} else if (pass == 1 && name[0]) {
 			int s;
 			for (s = 0; s < 100; s++) {
 				X32command *slot;
@@ -1910,7 +1969,27 @@ static void x32_scan_dir(const char *dir, const char *ext, int snippet, int pass
 					slot = x32_scene_at(s);
 				}
 				slotn = (slot && (slot + 1)->value.str) ? (slot + 1)->value.str : "";
-				if (slotn[0] && x32_casecmp(slotn, name) == 0) {
+				if (slotn[0] && x32_fold_eq(slotn, name)) {
+					x32_assign_body(snippet, s, path);
+					break;
+				}
+			}
+		} else if (pass == 2) {
+			char hdr[256];
+			int s;
+			if (!x32_header_name(path, hdr, sizeof hdr)) continue;
+			for (s = 0; s < 100; s++) {
+				X32command *slot;
+				const char *slotn;
+				if (snippet) {
+					if (!x32_snip_listed[s] || x32_snip_path[s][0]) continue;
+					slot = x32_snip_at(s);
+				} else {
+					if (!x32_scene_listed[s] || x32_scene_path[s][0]) continue;
+					slot = x32_scene_at(s);
+				}
+				slotn = (slot && (slot + 1)->value.str) ? (slot + 1)->value.str : "";
+				if (slotn[0] && x32_fold_eq(slotn, hdr)) {
 					x32_assign_body(snippet, s, path);
 					break;
 				}
@@ -1932,7 +2011,9 @@ static void x32_bind_files(int snippet) {
 	const char **subs = snippet ? subs_snp : subs_scn;
 	const char *ext = snippet ? ".snp" : ".scn";
 	int pass, si;
-	for (pass = 0; pass < 2; pass++) {
+	/* 0: index in the file name. 1: name, ignoring case and - _ space.
+	 * 2: the quoted name in the file's own #4.0# header. */
+	for (pass = 0; pass < 3; pass++) {
 		for (si = 0; subs[si]; si++) {
 			char dir[X32_PATHMAX];
 			if (subs[si][0]) {
@@ -2672,48 +2753,113 @@ int function_libs(void) {
 	return 0;
 }
 
-int function_showdump(void) {
+/* One node packet, firmware 4.x shape:
+ *   node ,s /-show/showfile/show "Name" <10 ints> "4.06"\n
+ *   node ,s /-show/showfile/cue/000 <numb> "name" <7 ints>\n
+ *   node ,s /-show/showfile/scene/000 "name" "notes" %bbbbbbbbb <hasdata>\n
+ *   node ,s /-show/showfile/snippet/000 "name" <4 ints> <hasdata>\n
+ * X32-Edit 4.3 fills the Cues view (show name + every cue) from /showdump,
+ * which is this same series. Scenes and snippets use the same lines.
+ */
+static void x32_emit_show(int show, int cues, int scenes, int snippets) {
 	char line[480];
 	char qn[80], qt[160], bits[16];
 	int n;
-	const char *shown = Xshow[4].value.str ? Xshow[4].value.str : "";
-	x32_qstr(qn, 80, shown);
-	sprintf(line, "/-show/showfile/show %s %d %d %d %d %d %d %d %d %d %d \"%s\"\n",
-		qn,
-		Xshow[5].value.ii, Xshow[6].value.ii, Xshow[7].value.ii, Xshow[8].value.ii,
-		Xshow[9].value.ii, Xshow[10].value.ii, Xshow[11].value.ii, Xshow[12].value.ii,
-		Xshow[13].value.ii, Xshow[14].value.ii, XVERSION);
+	if (show) {
+		const char *shown = Xshow[4].value.str ? Xshow[4].value.str : "";
+		x32_qstr(qn, 80, shown);
+		sprintf(line, "/-show/showfile/show %s %d %d %d %d %d %d %d %d %d %d \"%s\"\n",
+			qn,
+			Xshow[5].value.ii, Xshow[6].value.ii, Xshow[7].value.ii, Xshow[8].value.ii,
+			Xshow[9].value.ii, Xshow[10].value.ii, Xshow[11].value.ii, Xshow[12].value.ii,
+			Xshow[13].value.ii, Xshow[14].value.ii, XVERSION);
+		x32_send_node(line);
+	}
+	if (cues) {
+		for (n = 0; n < 500; n++) {
+			X32command *p = x32_cue_at(n);
+			if (!p || !x32_cue_used(p)) continue;
+			x32_qstr(qn, 80, (p + 2)->value.str);
+			sprintf(line, "/-show/showfile/cue/%03d %d %s %d %d %d %d %d %d %d\n",
+				n, (p + 1)->value.ii, qn, (p + 3)->value.ii, (p + 4)->value.ii,
+				(p + 5)->value.ii, (p + 6)->value.ii, (p + 7)->value.ii,
+				(p + 8)->value.ii, (p + 9)->value.ii);
+			x32_send_node(line);
+		}
+	}
+	if (scenes) {
+		for (n = 0; n < 100; n++) {
+			X32command *p = x32_scene_at(n);
+			if (!p) break;
+			if (!(p + 4)->value.ii && !((p + 1)->value.str && (p + 1)->value.str[0])) continue;
+			x32_qstr(qn, 80, (p + 1)->value.str);
+			x32_qstr(qt, 160, (p + 2)->value.str);
+			x32_bits9(bits, (p + 3)->value.ii);
+			sprintf(line, "/-show/showfile/scene/%03d %s %s %s %d\n", n, qn, qt, bits, (p + 4)->value.ii);
+			x32_send_node(line);
+		}
+	}
+	if (snippets) {
+		for (n = 0; n < 100; n++) {
+			X32command *p = x32_snip_at(n);
+			if (!p) break;
+			if (!(p + 6)->value.ii && !((p + 1)->value.str && (p + 1)->value.str[0])) continue;
+			x32_qstr(qn, 80, (p + 1)->value.str);
+			sprintf(line, "/-show/showfile/snippet/%03d %s %d %d %d %d %d\n",
+				n, qn, (p + 2)->value.ii, (p + 3)->value.ii, (p + 4)->value.ii,
+				(p + 5)->value.ii, (p + 6)->value.ii);
+			x32_send_node(line);
+		}
+	}
+}
+
+static void x32_emit_prepos(void) {
+	char line[64];
+	sprintf(line, "/-show/prepos/current %d\n", Xshow[0].value.ii);
 	x32_send_node(line);
-	for (n = 0; n < 500; n++) {
-		X32command *p = x32_cue_at(n);
-		if (!p || !x32_cue_used(p)) continue;
-		x32_qstr(qn, 80, (p + 2)->value.str);
-		sprintf(line, "/-show/showfile/cue/%03d %d %s %d %d %d %d %d %d %d\n",
-			n, (p + 1)->value.ii, qn, (p + 3)->value.ii, (p + 4)->value.ii,
-			(p + 5)->value.ii, (p + 6)->value.ii, (p + 7)->value.ii,
-			(p + 8)->value.ii, (p + 9)->value.ii);
-		x32_send_node(line);
+}
+
+/* /node ,s <req> for a show-catalog parent. Returns 1 when this answered
+ * (packets already sent). A slot or a single field (/cue/000, /cue/000/name)
+ * stays with function_node. */
+int x32_show_node(const char *req) {
+	if (!req || strncmp(req, "-show", 5) != 0) return 0;
+	if (req[5] != 0 && req[5] != '/') return 0;
+	if (strcmp(req, "-show") == 0 || strcmp(req, "-show/showfile") == 0) {
+		x32_emit_show(1, 1, 1, 1);
+		s_len = 0;
+		return 1;
 	}
-	for (n = 0; n < 100; n++) {
-		X32command *p = x32_scene_at(n);
-		if (!p) break;
-		if (!(p + 4)->value.ii && !((p + 1)->value.str && (p + 1)->value.str[0])) continue;
-		x32_qstr(qn, 80, (p + 1)->value.str);
-		x32_qstr(qt, 160, (p + 2)->value.str);
-		x32_bits9(bits, (p + 3)->value.ii);
-		sprintf(line, "/-show/showfile/scene/%03d %s %s %s %d\n", n, qn, qt, bits, (p + 4)->value.ii);
-		x32_send_node(line);
+	if (strcmp(req, "-show/showfile/show") == 0) {
+		x32_emit_show(1, 0, 0, 0);
+		s_len = 0;
+		return 1;
 	}
-	for (n = 0; n < 100; n++) {
-		X32command *p = x32_snip_at(n);
-		if (!p) break;
-		if (!(p + 6)->value.ii && !((p + 1)->value.str && (p + 1)->value.str[0])) continue;
-		x32_qstr(qn, 80, (p + 1)->value.str);
-		sprintf(line, "/-show/showfile/snippet/%03d %s %d %d %d %d %d\n",
-			n, qn, (p + 2)->value.ii, (p + 3)->value.ii, (p + 4)->value.ii,
-			(p + 5)->value.ii, (p + 6)->value.ii);
-		x32_send_node(line);
+	if (strcmp(req, "-show/showfile/cue") == 0) {
+		x32_emit_show(0, 1, 0, 0);
+		s_len = 0;
+		return 1;
 	}
+	if (strcmp(req, "-show/showfile/scene") == 0) {
+		x32_emit_show(0, 0, 1, 0);
+		s_len = 0;
+		return 1;
+	}
+	if (strcmp(req, "-show/showfile/snippet") == 0) {
+		x32_emit_show(0, 0, 0, 1);
+		s_len = 0;
+		return 1;
+	}
+	if (strcmp(req, "-show/prepos") == 0 || strcmp(req, "-show/prepos/current") == 0) {
+		x32_emit_prepos();
+		s_len = 0;
+		return 1;
+	}
+	return 0;
+}
+
+int function_showdump(void) {
+	x32_emit_show(1, 1, 1, 1);
 	s_len = 0;
 	return 0;
 }
